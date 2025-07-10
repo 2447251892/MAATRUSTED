@@ -8,6 +8,7 @@ import time
 from utils.logger import setup_experiment_logging
 from time_series_maa import MAA_time_series
 import torch
+import sys
 
 
 def find_stock_files(base_dir, stock_name=None, sector=None):
@@ -32,19 +33,20 @@ def find_stock_files(base_dir, stock_name=None, sector=None):
 
 def run_experiment_for_stock(args, stock_csv_path):
     """为单个股票的数据文件运行一次完整的实验（训练或预测）。"""
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
     path_parts = stock_csv_path.replace('\\', '/').split('/')
     stock_name = path_parts[-2]
     sector_name = path_parts[-3]
 
-    stock_specific_output_dir = os.path.join(args.output_dir, sector_name, stock_name, timestamp)
-    stock_specific_ckpt_dir = os.path.join(args.ckpt_dir, sector_name, stock_name, timestamp)
+    experiment_base_dir = os.path.join(args.output_dir, sector_name, stock_name)
+    stock_specific_ckpt_dir = os.path.join(experiment_base_dir, 'ckpt')
+    stock_specific_output_dir = experiment_base_dir
+
     os.makedirs(stock_specific_output_dir, exist_ok=True)
     os.makedirs(stock_specific_ckpt_dir, exist_ok=True)
 
-    print(f"\n{'=' * 20} 开始处理股票: {sector_name} - {stock_name} (时间戳: {timestamp}) {'=' * 20}")
+    print(f"\n{'=' * 20} 开始处理股票: {sector_name} - {stock_name} {'=' * 20}")
     print(f"数据源: {stock_csv_path}")
-    print(f"输出目录: {stock_specific_output_dir}")
+    print(f"统一实验目录: {stock_specific_output_dir}")
     print(f"模型保存目录: {stock_specific_ckpt_dir}")
 
     framework_args = args
@@ -70,15 +72,13 @@ def run_experiment_for_stock(args, stock_csv_path):
     full_df = pd.read_csv(stock_csv_path, usecols=['date'])
     date_series = pd.to_datetime(full_df['date'], format='%Y%m%d')
 
-    target_column = 'close'
-    exclude_columns = ['date', 'direction']
     predict_csv_path = stock_csv_path.replace(os.path.join('train'), os.path.join('predict'))
 
     gca.process_data(
         train_csv_path=stock_csv_path,
         predict_csv_path=predict_csv_path,
-        target_column=target_column,
-        exclude_columns=exclude_columns
+        target_column='close',
+        exclude_columns=['date', 'direction']
     )
 
     gca.init_dataloader()
@@ -88,11 +88,21 @@ def run_experiment_for_stock(args, stock_csv_path):
 
     results = None
     if framework_args.mode == "train":
-        results, best_model_state = gca.train(logger)
+        results, best_model_state = gca.train(logger, date_series=date_series)
+
         if best_model_state and any(s is not None for s in best_model_state):
-            print("\n--- 训练结束，保存最佳模型状态 ---")
+            print("\n--- 训练结束，保存相关产物 ---")
+
+            # 1. 保存模型
             gca.save_models(best_model_state)
 
+            # 2. 保存 Scaler
+            gca.save_scalers()
+
+            # 3. 生成并保存每日信号
+            gca.generate_and_save_daily_signals(best_model_state, predict_csv_path)
+
+            # 4. (可选) 生成预测对比CSV
             print("\n--- 加载最佳模型以生成预测对比CSV ---")
             for i in range(gca.N):
                 if best_model_state[i] is not None:
@@ -104,8 +114,9 @@ def run_experiment_for_stock(args, stock_csv_path):
 
     if results:
         master_results_file = os.path.join(args.output_dir, "master_results.csv")
+        timestamp_for_log = time.strftime("%Y%m%d-%H%M%S")
         result_row = {
-            "timestamp": timestamp,
+            "timestamp": timestamp_for_log,
             "sector": sector_name,
             "stock": stock_name,
             "train_mse": results["train_mse"],
@@ -119,3 +130,7 @@ def run_experiment_for_stock(args, stock_csv_path):
         print(f"===== 股票 {stock_name} 处理完毕, 结果已记录到 {master_results_file} =====")
     else:
         print(f"===== 股票 {stock_name} 处理完毕, 但没有结果需要记录 =====")
+
+# 注意：下面的 main 函数应该位于 experiment_runner.py 中。
+# 这里不包含 main 函数的定义，因为此文件的角色是被调度的模块。
+# 您需要确保 experiment_runner.py 中的 main 函数能正确调用此文件中的 run_experiment_for_stock。

@@ -26,7 +26,7 @@ COMMON_ARGS = {
     "discriminators": None,
     "distill_epochs": 1,
     "cross_finetune_epochs": 5,
-    "num_epochs": 200,
+    "num_epochs": 100,
     "lr": 2e-5,
     "batch_size": 64,
     "train_split": 0.8,

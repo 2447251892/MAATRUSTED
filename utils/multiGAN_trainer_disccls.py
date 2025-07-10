@@ -7,9 +7,12 @@ import torch.optim.lr_scheduler as lr_scheduler
 import time
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-
+# ==================== MODIFIED IMPORT STATEMENTS ====================
+# 使用相对导入，因为此文件在 utils 包内
+from .evaluate_visualization import *
+from .util import get_autocast_context
+# ====================================================================
 import logging  # NEW
-from utils.util import get_autocast_context
 from torch.cuda.amp import GradScaler
 
 scaler = GradScaler()
@@ -33,7 +36,10 @@ def train_multi_gan(args, generators, discriminators, dataloaders,
                         [0.333, 0.333, 0.333, 1.0]  # gammas_final...,
                     ],
                     logger=None,
-                    dynamic_weight = False):
+                    dynamic_weight = False,
+                    # ==================== MODIFICATION START ====================
+                    date_series=None):
+    # ===================== MODIFICATION END =====================
     N = len(generators)
 
     assert N == len(discriminators)
@@ -326,72 +332,6 @@ def train_multi_gan(args, generators, discriminators, dataloaders,
 
                 validate_G_loss, validate_G_acc = validate_with_label(generators[G_rank[0]], val_xes[G_rank[0]], val_y, val_labels[G_rank[0]])
 
-                    # g0 = G_rank[0]  # Best Generator index
-                    # # —— 1. Train all D_i ——
-                    # for d0 in D_rank:
-                    #     generators[g0].eval()
-                    #     discriminators[d0].train()
-                    #
-                    #     # Only use the input from G_best X[g0], corresponding label LABELS[d0] for D_i
-                    #     loss_D, _ = discriminate_fake(
-                    #         args,
-                    #         [X[g0]], [Y[d0]], [LABELS[d0]],
-                    #         [generators[g0]], [discriminators[d0]],
-                    #         [window_sizes[d0]], target_num,
-                    #         criterion,
-                    #         weight_matrix[d0, g0],  # Original weight for (D_i, G_best)
-                    #         device,
-                    #         mode="train_D"
-                    #     )
-                    #     optimizers_D[d0].zero_grad()
-                    #     scaler.scale(loss_D.sum()).backward()
-                    #     scaler.step(optimizers_D[d0])
-                    #     scaler.update()
-                    #
-                    # # —— 2. Find the D with the minimum loss for G_best ——
-                    # gen_losses = []
-                    # for d0 in D_rank:
-                    #     # Note: mode="train_G" here, returns loss_G, loss_mse_G
-                    #     loss_G, _ = discriminate_fake(
-                    #         args,
-                    #         [X[g0]], [Y[d0]], [LABELS[d0]],
-                    #         [generators[g0]], [discriminators[d0]],
-                    #         [window_sizes[d0]], target_num,
-                    #         criterion,
-                    #         weight_matrix[d0, g0],
-                    #         device,
-                    #         mode="train_G"
-                    #     )
-                    #     gen_losses.append(loss_G.item())
-                    #
-                    # # Index of D corresponding to minimum loss
-                    # d_min = D_rank[int(np.argmin(gen_losses))]
-                    #
-                    # # —— 3. Train the generator with D_min ——
-                    # discriminators[d_min].eval()
-                    # generators[g0].train()
-                    #
-                    # loss_G, loss_mse_G = discriminate_fake(
-                    #     args,
-                    #     [X[g0]], [Y[d_min]], [LABELS[d_min]],
-                    #     [generators[g0]], [discriminators[d_min]],
-                    #     [window_sizes[d_min]], target_num,
-                    #     criterion,
-                    #     weight_matrix[d_min, g0],
-                    #     device,
-                    #     mode="train_G"
-                    # )
-                    # optimizers_G[g0].zero_grad()
-                    # scaler.scale(loss_G.sum()).backward()
-                    # scaler.step(optimizers_G[g0])
-                    # scaler.update()
-                    #
-                    # # Finally, perform another validation
-                    # validate_G_loss, validate_G_acc = validate_with_label(
-                    #     generators[g0],
-                    #     val_xes[g0], val_y, val_labels[g0]
-                    # )
-
                 if validate_G_loss >= cross_best_Gloss:
                     generators[G_rank[0]].load_state_dict(best_model_state[G_rank[0]])
                     break
@@ -401,10 +341,6 @@ def train_multi_gan(args, generators, discriminators, dataloaders,
                     best_model_state[G_rank[0]] = copy.deepcopy(generators[G_rank[0]].state_dict())
                     best_epoch[G_rank[0]] = epoch + 1
 
-                # print(
-                #     f"== Cross finetune Epoch [{e + 1}/{num_epochs}]: G{G_rank[0] + 1} with D{d_min + 1}: Validation MSE {validate_G_loss:.8f}, Validation Acc {validate_G_acc*100:.2f}%")
-                # logging.info(
-                #     f"== Cross finetune Epoch [{e + 1}/{num_epochs}]: G{G_rank[0] + 1} wi
                 print(
                     f"== Cross finetune Epoch [{e + 1}/{num_epochs}]: G{G_rank[0] + 1} with D{D_rank[0] + 1}: Validation MSE {validate_G_loss:.8f}, Validation Acc {validate_G_acc*100:.2f}%")
                 logging.info(
@@ -471,8 +407,11 @@ def train_multi_gan(args, generators, discriminators, dataloaders,
     print(f"Best epochs | {best_info}")
     logging.info(f"Best epochs | {best_info}")
 
+    # ==================== MODIFICATION START ====================
+    # Pass date_series to evaluate_best_models
     results = evaluate_best_models(generators, best_model_state, train_xes, train_y, val_xes, val_y, y_scaler,
-                                   output_dir)
+                                   output_dir, date_series=date_series)
+    # ===================== MODIFICATION END =====================
 
     return results, best_model_state
 

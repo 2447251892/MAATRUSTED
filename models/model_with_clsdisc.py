@@ -41,7 +41,7 @@ class Generator_gru(nn.Module):
 
 
 class Generator_lstm(nn.Module):
-    def __init__(self, input_size, out_size, hidden_size=128, num_layers=1, dropout=0.1):
+    def __init__(self, input_size, out_size, hidden_size=128, num_layers=2, dropout=0.1):
         """
         Args:
             input_size (int): Number of input features

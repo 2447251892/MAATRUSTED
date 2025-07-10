@@ -14,6 +14,7 @@ import os
 import time
 import glob
 from utils.evaluate_visualization import evaluate_best_models
+import joblib
 
 
 def log_execution_time(func):
@@ -108,6 +109,7 @@ class MAA_time_series(MAABase):
 
         print(f"目标列: {target_column}")
         print(f"已自动识别 {len(feature_columns)} 个特征列。")
+        self.feature_columns = feature_columns  # 保存特征列列表以备后用
 
         x_from_train_df = train_df[feature_columns].values
         y_from_train_df = train_df[[target_column]].values
@@ -129,7 +131,6 @@ class MAA_time_series(MAABase):
 
         print(f"数据加载、划分和归一化完成。训练集: {len(self.train_y)} 条, 测试集: {len(self.test_y)} 条。")
 
-    # create_sequences_combine, init_dataloader, init_model, init_hyperparameters, train, save_models 保持不变
     def create_sequences_combine(self, x, y, label, window_size, start):
         x_, y_, y_gan, label_gan = [], [], [], []
         for i in range(start, x.shape[0]):
@@ -184,16 +185,18 @@ class MAA_time_series(MAABase):
         self.final_GDweight = self.gan_weights if self.gan_weights else [[round(1.0 / self.N, 3)] * self.N + [1.0] for _
                                                                          in range(self.N)]
 
-    def train(self, logger):
+    def train(self, logger, date_series=None):
         return train_multi_gan(self.args, self.generators, self.discriminators, self.dataloaders,
                                self.window_sizes, self.y_scaler, self.train_x_all, self.train_y_all,
                                self.test_x_all, self.test_y_all, self.test_label_gan_all,
                                self.do_distill_epochs, self.cross_finetune_epochs, self.num_epochs,
                                self.output_dir, self.device, init_GDweight=self.init_GDweight,
-                               final_GDweight=self.final_GDweight, logger=logger)
+                               final_GDweight=self.final_GDweight, logger=logger,
+                               date_series=date_series)
 
     def save_models(self, best_model_state):
-        gen_dir, disc_dir = os.path.join(self.ckpt_dir, "generators"), os.path.join(self.ckpt_dir, "discriminators")
+        gen_dir = os.path.join(self.ckpt_dir, "generators")
+        disc_dir = os.path.join(self.ckpt_dir, "discriminators")
         os.makedirs(gen_dir, exist_ok=True)
         os.makedirs(disc_dir, exist_ok=True)
         for i, gen_name in enumerate(self.generator_names):
@@ -219,11 +222,23 @@ class MAA_time_series(MAABase):
                     y_true_norm = self.test_y_all.cpu().numpy().reshape(-1, 1)
                     y_pred = self.y_scaler.inverse_transform(y_pred_norm).flatten()
                     y_true = self.y_scaler.inverse_transform(y_true_norm).flatten()
-                    df_out = pd.DataFrame({'true': y_true, 'pred': y_pred})
+
+                    y_true_matched = y_true[-len(y_pred):]
+                    df_out = pd.DataFrame({'true': y_true_matched, 'pred': y_pred})
+
                     if date_series is not None:
-                        test_dates = date_series.iloc[-len(self.test_y_all):]
-                        df_out['date'] = test_dates.values
-                        df_out = df_out[['date', 'true', 'pred']]
+                        total_size_in_series = len(date_series)
+                        test_size_processed = len(self.test_y_all)
+                        test_start_idx_in_series = total_size_in_series - test_size_processed
+
+                        if test_start_idx_in_series >= 0:
+                            test_dates = date_series.iloc[test_start_idx_in_series:].reset_index(drop=True)
+                            dates_for_csv = test_dates.iloc[-len(y_pred):].reset_index(drop=True)
+                            df_out['date'] = dates_for_csv
+                            df_out = df_out[['date', 'true', 'pred']]
+                        else:
+                            print(f"警告: 无法为生成器 {i + 1} 的CSV文件分配日期。")
+
                     csv_save_dir = os.path.join(self.output_dir, "true2pred_csv")
                     os.makedirs(csv_save_dir, exist_ok=True)
                     out_path = os.path.join(csv_save_dir, f'predictions_gen_{i + 1}_{self.generator_names[i]}.csv')
@@ -256,7 +271,82 @@ class MAA_time_series(MAABase):
         self.save_predictions_to_csv(date_series=date_series)
         return results
 
-    # 保持其他抽象方法的空实现
+    def save_scalers(self):
+        """保存数据归一化 scaler。"""
+        if not hasattr(self, 'x_scalers') or not hasattr(self, 'y_scaler'):
+            print("错误: Scalers 尚未初始化，无法保存。")
+            return
+
+        try:
+            x_scaler_path = os.path.join(self.output_dir, 'x_scaler.gz')
+            joblib.dump(self.x_scalers[0], x_scaler_path)
+
+            y_scaler_path = os.path.join(self.output_dir, 'y_scaler.gz')
+            joblib.dump(self.y_scaler, y_scaler_path)
+            print(f"Scaler 已成功保存至: {self.output_dir}")
+        except Exception as e:
+            print(f"错误: 保存 scaler 失败: {e}")
+
+    def generate_and_save_daily_signals(self, best_model_state, predict_csv_path):
+        """
+        加载最佳模型，对完整的预测数据进行滚动预测，并保存每日信号。
+        """
+        if not hasattr(self, 'x_scalers'):
+            print("错误: 缺少 x_scalers，无法进行信号生成。请先运行 process_data。")
+            return
+
+        if not best_model_state or not any(s is not None for s in best_model_state):
+            print("没有可用的最佳模型状态，跳过每日信号生成。")
+            return
+
+        print("\n--- 开始为所有模型生成每日预测信号 ---")
+
+        try:
+            df_predict = pd.read_csv(predict_csv_path)
+        except FileNotFoundError:
+            print(f"错误：找不到预测数据文件 {predict_csv_path}。")
+            return
+
+        x_scaler = self.x_scalers[0]
+
+        for i, state in enumerate(best_model_state):
+            if state is None:
+                continue
+
+            gen_name = self.generator_names[i]
+            window_size = self.window_sizes[i]
+            generator = self.generators[i]
+            generator.load_state_dict(state)
+            generator.eval()
+
+            print(f"正在处理模型: G{i + 1} ({gen_name})，窗口大小: {window_size}")
+
+            signals = []
+
+            # 使用在 process_data 中保存的特征列
+            feature_columns = self.feature_columns
+
+            for j in range(window_size, len(df_predict)):
+                df_segment = df_predict.iloc[j - window_size: j]
+
+                sequence_data = df_segment[feature_columns].values
+                scaled_sequence = x_scaler.transform(sequence_data)
+                input_tensor = torch.from_numpy(np.array([scaled_sequence])).float().to(self.device)
+
+                with torch.no_grad():
+                    _, logits = generator(input_tensor)
+                    prediction = logits.argmax(dim=1).item()
+
+                signal_date = df_predict.iloc[j]['date']
+                signals.append({'date': signal_date, 'predicted_action': prediction})
+
+            if signals:
+                df_signals = pd.DataFrame(signals)
+                signal_filename = f'G{i + 1}_{gen_name}_daily_signals.csv'
+                signal_filepath = os.path.join(self.output_dir, signal_filename)
+                df_signals.to_csv(signal_filepath, index=False)
+                print(f"已保存每日信号文件: {signal_filepath}")
+
     def distill(self):
         pass
 
