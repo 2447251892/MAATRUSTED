@@ -1,599 +1,308 @@
+# 文件名: utils/multiGAN_trainer_disccls.py
+
 import torch.nn as nn
 import copy
-
-
 from .evaluate_visualization import *
 import torch.optim.lr_scheduler as lr_scheduler
 import time
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-# ==================== MODIFIED IMPORT STATEMENTS ====================
-# 使用相对导入，因为此文件在 utils 包内
-from .evaluate_visualization import *
 from .util import get_autocast_context
-# ====================================================================
-import logging  # NEW
+import logging
 from torch.cuda.amp import GradScaler
+import numpy as np
 
 scaler = GradScaler()
 
 
-def train_multi_gan(args, generators, discriminators, dataloaders,
-                    window_sizes,
-                    y_scaler, train_xes, train_y, val_xes, val_y, val_labels,
-                    distill_epochs, cross_finetune_epochs,
-                    num_epochs,
-                    output_dir,
-                    device,
-                    init_GDweight=[
-                        [1, 0, 0, 1.0],  # alphas_init
-                        [0, 1, 0, 1.0],  # betas_init
-                        [0., 0, 1, 1.0]  # gammas_init...
-                    ],
-                    final_GDweight=[
-                        [0.333, 0.333, 0.333, 1.0],  # alphas_final
-                        [0.333, 0.333, 0.333, 1.0],  # betas_final
-                        [0.333, 0.333, 0.333, 1.0]  # gammas_final...,
-                    ],
-                    logger=None,
-                    dynamic_weight = False,
-                    # ==================== MODIFICATION START ====================
-                    date_series=None):
-    # ===================== MODIFICATION END =====================
+def get_loss_function(name):
+    if name == 'bce':
+        return nn.BCEWithLogitsLoss()
+    elif name == 'mse':
+        return nn.MSELoss()
+    elif name == 'mae':
+        return nn.L1Loss()
+    elif name == 'cross_entropy':
+        return nn.CrossEntropyLoss()
+    else:
+        raise ValueError(f"未知的损失函数名称: {name}")
+
+
+def train_multi_gan(args, generators, discriminators, dataloaders, window_sizes, y_scaler, train_xes, train_y, val_xes,
+                    val_y, val_y_gan, val_label_gan, distill_epochs, cross_finetune_epochs, num_epochs, output_dir,
+                    device, init_GDweight=[[1, 0, 0, 1.0], [0, 1, 0, 1.0], [0., 0, 1, 1.0]],
+                    final_GDweight=[[0.333, 0.333, 0.333, 1.0], [0.333, 0.333, 0.333, 1.0], [0.333, 0.333, 0.333, 1.0]],
+                    logger=None, dynamic_weight=False, date_series=None):
     N = len(generators)
-
-    assert N == len(discriminators)
-    assert N == len(window_sizes)
-    assert N >= 1
-
-    g_learning_rate = 2e-5
-    d_learning_rate = 2e-5
-
-    # Binary cross-entropy loss function, might have issues
-    # criterion = nn.BCELoss()
-    criterion = nn.BCEWithLogitsLoss()
-
-    optimizers_G = [torch.optim.AdamW(model.parameters(), lr=g_learning_rate, betas=(0.9, 0.999))
-                    for model in generators]
-
-    # Set ReduceLROnPlateau scheduler for each optimizer
-    schedulers = [lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=16, min_lr=1e-7)
-                  for optimizer in optimizers_G]
-
-    optimizers_D = [torch.optim.Adam(model.parameters(), lr=d_learning_rate, betas=(0.9, 0.999))
-                    for model in discriminators]
-
-    best_epoch = [-1 for _ in range(N)]  #
-
-    # Define keys for generating history records
-    """
-    Taking three as an example, the keys look like this:
-    ['G1', 'G2', 'G3',
-    'D1', 'D2', 'D3',
-    'MSE_G1', 'MSE_G2', 'MSE_G3',
-    'val_G1', 'val_G2', 'val_G3',
-    'D1_G1', 'D2_G1', 'D3_G1', 'D1_G2', 'D2_G2', 'D3_G2', 'D1_G3', 'D2_G3', 'D3_G3'
-    ]
-    """
-
-    keys = []
-    g_keys = [f'G{i}' for i in range(1, N + 1)]
-    d_keys = [f'D{i}' for i in range(1, N + 1)]
-    MSE_g_keys = [f'MSE_G{i}' for i in range(1, N + 1)]
-    val_loss_keys = [f'val_G{i}' for i in range(1, N + 1)]
-    acc_keys = [f'acc_G{i}' for i in range(1, N + 1)]
-
-    keys.extend(g_keys)
-    keys.extend(d_keys)
-    keys.extend(MSE_g_keys)
-    keys.extend(val_loss_keys)
+    adv_criterion, reg_criterion, cls_criterion = get_loss_function(args.adversarial_loss_mode), get_loss_function(
+        args.regression_loss_mode), get_loss_function('cross_entropy')
+    optimizers_G = [torch.optim.AdamW(m.parameters(), lr=args.lr, betas=(0.9, 0.999)) for m in generators]
+    monitor_mode = 'max' if args.monitor_metric == 'val_acc' else 'min'
+    schedulers = [lr_scheduler.ReduceLROnPlateau(opt, mode=monitor_mode, factor=0.1, patience=16, min_lr=1e-7) for opt
+                  in optimizers_G]
+    optimizers_D = [torch.optim.Adam(m.parameters(), lr=args.lr, betas=(0.9, 0.999)) for m in discriminators]
+    best_epoch = [-1] * N
+    keys = [];
+    g_keys, d_keys, MSE_g_keys, val_loss_keys, acc_keys = [f'G{i}' for i in range(1, N + 1)], [f'D{i}' for i in
+                                                                                               range(1, N + 1)], [
+        f'MSE_G{i}' for i in range(1, N + 1)], [f'val_G{i}' for i in range(1, N + 1)], [f'acc_G{i}' for i in
+                                                                                        range(1, N + 1)]
+    keys.extend(g_keys);
+    keys.extend(d_keys);
+    keys.extend(MSE_g_keys);
+    keys.extend(val_loss_keys);
     keys.extend(acc_keys)
-
-    d_g_keys = []
-    for g_key in g_keys:
-        for d_key in d_keys:
-            d_g_keys.append(d_key + "_" + g_key)
+    d_g_keys = [f'D{i}_G{j}' for i in range(1, N + 1) for j in range(1, N + 1)];
     keys.extend(d_g_keys)
-
-    # Create a dictionary containing np.zeros(num_epochs) for each key
-    hists_dict = {key: np.zeros(num_epochs) for key in keys}
-
-    best_mse = [float('inf') for _ in range(N)]
-
-    best_model_state = [None for _ in range(N)]
-
-    patience_counter = 0
-    patience = 15
-    feature_num = train_xes[0].shape[2]
-    target_num = train_y.shape[-1]
-
+    hists_dict = {k: np.zeros(num_epochs) for k in keys}
+    best_monitor_metric = [float('-inf') if args.monitor_metric == 'val_acc' else float('inf') for _ in range(N)]
+    best_model_state, patience_counter, patience = [None] * N, 0, 15
     print("start training")
     for epoch in range(num_epochs):
         epo_start = time.time()
-
-        if epoch < 10:
-            weight_matrix = torch.tensor(init_GDweight).to(device)
-        elif dynamic_weight:
-            # —— Dynamically calculate G-D weight matrix ——
-            # Get the loss for each G from the previous round's validation loss
-            # val_loss_keys = ['val_G1', 'val_G2', ..., 'val_GN']
-            losses = torch.stack([
-                      torch.tensor(hists_dict[val_loss_keys[i]][epoch - 1])
-             for i in range(N)
-            ]).to(device)  # shape: [N]
-
-            # Performance Perf_i = -loss_i, beta controls "hardness"
-            perf = torch.exp(-losses)  # shape: [N]
-            probs = perf / perf.sum()  # shape: [N], softmax over generators
-
-            # Construct N×N matrix used for training Generator: each row is the same distribution
-            weight_G = probs.unsqueeze(0).repeat(N, 1)  # shape: [N, N]
-            weight_G = weight_G + torch.eye(N, device=device)
-
-            # Construct N×(N+1) matrix for training Discriminator: the last column remains 1.0 (for real data)
-            ones = torch.ones((N, 1), device=device)
-            weight_matrix = torch.cat([weight_G, ones], dim=1)  # shape: [N, N+1]
-        else:
-            weight_matrix = torch.tensor(final_GDweight).to(device)
-
-        keys = []
-        keys.extend(g_keys)
-        keys.extend(d_keys)
-        keys.extend(MSE_g_keys)
-        keys.extend(d_g_keys)
-
-        loss_dict = {key: [] for key in keys}
-
-        # use the gap the equalize the length of different generators
-        gaps = [window_sizes[-1] - window_sizes[i] for i in range(N - 1)]
-
+        weight_matrix = torch.tensor(init_GDweight if epoch < 10 else final_GDweight).to(device)
+        loss_dict = {k: [] for k in keys if k not in val_loss_keys and k not in acc_keys}
+        gaps = [window_sizes[-1] - w for w in window_sizes]
         for batch_idx, (x_last, y_last, label_last) in enumerate(dataloaders[-1]):
-            # TODO: maybe try to random select a gap from the whole time windows
-            x_last = x_last.to(device)
-            y_last = y_last.to(device)
-            label_last = label_last.to(device)
-            label_last = label_last.unsqueeze(-1)
-            # print(x_last.shape, y_last.shape, label_last.shape)
-
-            X = []
-            Y = []
-            LABELS = []
-
-            for gap in gaps:
-                X.append(x_last[:, gap:, :])
-                Y.append(y_last[:, gap:, :])
-                LABELS.append(label_last[:, gap:, :].long())
-            X.append(x_last.to(device))
-            Y.append(y_last.to(device))
-            LABELS.append(label_last.to(device).long())
-
-            for i in range(N):
-                generators[i].eval()
-                discriminators[i].train()
-
-            loss_D, lossD_G = discriminate_fake(args, X, Y, LABELS,
-                                                generators, discriminators,
-                                                window_sizes, target_num,
-                                                criterion, weight_matrix,
-                                                device, mode="train_D")
-
-            # 3. Store into loss_dict
-            for i in range(N):
-                loss_dict[d_keys[i]].append(loss_D[i].item())
-
+            x_last, y_last, label_last = x_last.to(device), y_last.to(device), label_last.to(device).unsqueeze(-1)
+            X, Y, LABELS = [], [], []
+            for gap in gaps: X.append(x_last[:, gap:, :]); Y.append(y_last[:, gap:, :]); LABELS.append(
+                label_last[:, gap:, :].long())
+            for i in range(N): generators[i].eval(); discriminators[i].train()
+            loss_D, lossD_G = discriminate_fake(args, X, Y, LABELS, generators, discriminators, window_sizes,
+                                                y_last.shape[-1], adv_criterion, reg_criterion, cls_criterion,
+                                                weight_matrix, device, "train_D")
+            for i in range(N): loss_dict[d_keys[i]].append(loss_D[i].item())
             for i in range(1, N + 1):
-                for j in range(1, N + 1):
-                    key = f'D{i}_G{j}'
-                    loss_dict[key].append(lossD_G[i - 1, j - 1].item())
-
-            # based on batch index parity cross-train the two GANs (Comment removed as code doesn't match)
-            # if batch_idx% 2 == 0:
-            for optimizer_D in optimizers_D:
-                optimizer_D.zero_grad()
-
-            # TODO: to see whether there is need to add together
-
-            # for i, loss in enumerate(loss_D):
-            #     if i != N - 1:
-            #         loss.backward(retain_graph=True)
-            #     else:
-            #         loss.backward()
-
-            # loss_D.sum(dim=0).backward()
+                for j in range(1, N + 1): loss_dict[f'D{i}_G{j}'].append(lossD_G[i - 1, j - 1].item())
+            for opt in optimizers_D: opt.zero_grad()
             scaler.scale(loss_D.sum(dim=0)).backward()
+            for i in range(N): scaler.step(optimizers_D[i]); scaler.update(); discriminators[i].eval(); generators[
+                i].train()
+            weight = weight_matrix[:, :-1].clone().detach()
+            loss_G, loss_mse_G = discriminate_fake(args, X, Y, LABELS, generators, discriminators, window_sizes,
+                                                   y_last.shape[-1], adv_criterion, reg_criterion, cls_criterion,
+                                                   weight, device, "train_G")
+            for i in range(N): loss_dict[g_keys[i]].append(loss_G[i].item()); loss_dict["MSE_" + g_keys[i]].append(
+                loss_mse_G[i].item())
+            for opt in optimizers_G: opt.zero_grad()
+            scaler.scale(loss_G.sum(dim=0)).backward()
+            for opt in optimizers_G: scaler.step(opt); scaler.update()
+        for k, v in loss_dict.items(): hists_dict[k][epoch] = np.mean(v)
 
-            for i in range(N):
-                # optimizers_D[i].step()
-                scaler.step(optimizers_D[i])
-                scaler.update()
-
-                discriminators[i].eval()
-                generators[i].train()
-
-            '''Train Generator'''
-            weight = weight_matrix[:, :-1].clone().detach()  # [N, N]
-
-            loss_G, loss_mse_G = discriminate_fake(args, X, Y, LABELS,
-                                                   generators, discriminators,
-                                                   window_sizes, target_num,
-                                                   criterion, weight,
-                                                   device,
-                                                   mode="train_G")
-
-            for i in range(N):
-                loss_dict[g_keys[i]].append(loss_G[i].item())
-                loss_dict["MSE_" + g_keys[i]].append(loss_mse_G[i].item())
-
-            for optimizer_G in optimizers_G:
-                optimizer_G.zero_grad()
-
-            # for i, loss in enumerate(loss_G):
-            # if i != N - 1:
-            #     loss.backward(retain_graph=True)
-            # else:
-            #     loss.backward()
-            # loss_G.sum(dim=0).backward()
-            scaler.scale(loss_G).sum(dim=0).backward()
-
-            for optimizer_G in optimizers_G:
-                # optimizer_G.step()
-                scaler.step(optimizer_G)
-                scaler.update()
-
-        for key in loss_dict.keys():
-            hists_dict[key][epoch] = np.mean(loss_dict[key])
-
-        improved = [False] * 3
+        improved = [False] * N
         for i in range(N):
-
-            hists_dict[val_loss_keys[i]][epoch],hists_dict[acc_keys[i]][epoch]  = validate_with_label(generators[i], val_xes[i], val_y, val_labels[i])
-
-            if hists_dict[val_loss_keys[i]][epoch].item() < best_mse[i]:
-                best_mse[i] = hists_dict[val_loss_keys[i]][epoch]
-                best_model_state[i] = copy.deepcopy(generators[i].state_dict())
-                best_epoch[i] = epoch + 1
-                improved[i] = True
-
-            schedulers[i].step(hists_dict[val_loss_keys[i]][epoch])
-
-        if distill_epochs > 0 and (epoch + 1) % 30 == 0:
-            # if distill and patience_counter > 1:
-            losses = [hists_dict[val_loss_keys[i]][epoch] for i in range(N)]
-            rank = np.argsort(losses)
-            print(f"Do distill {distill_epochs} epoch! Distill from G{rank[0] + 1} to G{rank[-1] + 1}")
-            logging.info(f"Do distill {distill_epochs} epoch! Distill from G{rank[0] + 1} to G{rank[-1] + 1}")
-            for e in range(distill_epochs):
-                do_distill(rank, generators, dataloaders, optimizers_G, window_sizes, device)
+            val_mse, val_acc, val_bce = validate_with_label(generators[i], discriminators[i], val_xes[i], val_y_gan[i],
+                                                            val_label_gan[i], adv_criterion)
+            hists_dict[val_loss_keys[i]][epoch], hists_dict[acc_keys[i]][epoch] = val_mse.item(), val_acc.item()
+            if args.monitor_metric == 'val_mse':
+                current_metric = val_mse.item()
+            elif args.monitor_metric == 'val_acc':
+                current_metric = val_acc.item()
+            else:
+                current_metric = val_bce.item()
+            is_better = (args.monitor_metric != 'val_acc' and current_metric < best_monitor_metric[i]) or (
+                        args.monitor_metric == 'val_acc' and current_metric > best_monitor_metric[i])
+            if is_better: best_monitor_metric[i] = current_metric; best_model_state[i] = copy.deepcopy(
+                generators[i].state_dict()); best_epoch[i] = epoch + 1; improved[i] = True
+            schedulers[i].step(current_metric)
 
         if (epoch + 1) % 10 == 0 and cross_finetune_epochs > 0:
             G_losses = [hists_dict[val_loss_keys[i]][epoch] for i in range(N)]
-            D_losses = [np.mean(loss_dict[d_keys[i]]) for i in range(N)]
-            G_rank = np.argsort(G_losses)
-            D_rank = np.argsort(D_losses)
-            print(f"Start cross finetune!  So far G{G_rank[0] + 1} with D{D_rank[0] + 1}")
-            logging.info(f"Start cross finetune!  So far G{G_rank[0] + 1} with D{D_rank[0] + 1}")
-            # if patience_counter > 1:
+            D_losses = [hists_dict[d_keys[i]][epoch] for i in range(N)]
+            G_rank, D_rank = np.argsort(G_losses), np.argsort(D_losses)
+            print(f"--- Start Cross Finetune on Epoch {epoch + 1} ---")
+            logging.info(f"Start cross finetune on Epoch {epoch + 1}! G{G_rank[0] + 1} with D{D_rank[0] + 1}")
+            cross_best_Gloss = np.inf
             for e in range(cross_finetune_epochs):
                 for batch_idx, (x_last, y_last, label_last) in enumerate(dataloaders[-1]):
-                    x_last = x_last.to(device)
-                    y_last = y_last.to(device)
-                    label_last = label_last.to(device)
-                    label_last = label_last.unsqueeze(-1)
-                    # print(x_last.shape, y_last.shape, label_last.shape)
-
-                    X = []
-                    Y = []
-                    LABELS = []
-
+                    x_last, y_last, label_last = x_last.to(device), y_last.to(device), label_last.to(device).unsqueeze(
+                        -1)
+                    X, Y, LABELS = [], [], []
                     for gap in gaps:
-                        X.append(x_last[:, gap:, :])
-                        Y.append(y_last[:, gap:, :])
+                        X.append(x_last[:, gap:, :]);
+                        Y.append(y_last[:, gap:, :]);
                         LABELS.append(label_last[:, gap:, :].long())
-                    X.append(x_last.to(device))
-                    Y.append(y_last.to(device))
-                    LABELS.append(label_last.to(device).long())
-                    cross_best_Gloss = np.inf
-
-                    generators[G_rank[0]].eval()
+                    X_finetune, Y_finetune, LABELS_finetune = X[G_rank[0]], Y[D_rank[0]], LABELS[D_rank[0]]
+                    generators[G_rank[0]].eval();
                     discriminators[D_rank[0]].train()
-
-                    loss_D, lossD_G = discriminate_fake(args, [X[G_rank[0]]], [Y[D_rank[0]]], [LABELS[D_rank[0]]],
-                                                        [generators[G_rank[0]]], [discriminators[D_rank[0]]],
-                                                        [window_sizes[D_rank[0]]], target_num,
-                                                        criterion, weight_matrix[D_rank[0], G_rank[0]],
-                                                        device, mode="train_D")
-
-                    optimizers_D[D_rank[0]].zero_grad()
-
-                    # loss_D.sum(dim=0).backward()
-                    scaler.scale(loss_D.sum(dim=0)).backward()
-                    # optimizers_D[D_rank[0]].step()
-                    scaler.step(optimizers_D[D_rank[0]])
+                    loss_D, _ = discriminate_fake(args, [X_finetune], [Y_finetune], [LABELS_finetune],
+                                                  [generators[G_rank[0]]], [discriminators[D_rank[0]]],
+                                                  [window_sizes[D_rank[0]]], y_last.shape[-1], adv_criterion,
+                                                  reg_criterion, cls_criterion, weight_matrix[D_rank[0], G_rank[0]],
+                                                  device, "train_D")
+                    optimizers_D[D_rank[0]].zero_grad();
+                    scaler.scale(loss_D.sum(dim=0)).backward();
+                    scaler.step(optimizers_D[D_rank[0]]);
                     scaler.update()
-
-                    discriminators[D_rank[0]].eval()
+                    discriminators[D_rank[0]].eval();
                     generators[G_rank[0]].train()
-
-                    '''Train Generator'''
-                    weight = weight_matrix[:, :-1].clone().detach()  # [N, N]
-                    loss_G, loss_mse_G = discriminate_fake(args, [X[G_rank[0]]], [Y[D_rank[0]]], [LABELS[D_rank[0]]],
-                                                           [generators[G_rank[0]]], [discriminators[D_rank[0]]],
-                                                           [window_sizes[D_rank[0]]], target_num,
-                                                           criterion, weight[D_rank[0], G_rank[0]],
-                                                           device,
-                                                           mode="train_G")
-
-                    optimizers_G[G_rank[0]].zero_grad()
-                    # loss_G.sum(dim=0).backward()
-                    scaler.scale(loss_G.sum(dim=0)).backward()
-                    # optimizers_G[G_rank[0]].step()
-                    scaler.step(optimizers_G[G_rank[0]])
+                    loss_G, _ = discriminate_fake(args, [X_finetune], [Y_finetune], [LABELS_finetune],
+                                                  [generators[G_rank[0]]], [discriminators[D_rank[0]]],
+                                                  [window_sizes[D_rank[0]]], y_last.shape[-1], adv_criterion,
+                                                  reg_criterion, cls_criterion,
+                                                  weight_matrix[D_rank[0], :-1].clone().detach()[G_rank[0]], device,
+                                                  "train_G")
+                    optimizers_G[G_rank[0]].zero_grad();
+                    scaler.scale(loss_G.sum(dim=0)).backward();
+                    scaler.step(optimizers_G[G_rank[0]]);
                     scaler.update()
 
-                validate_G_loss, validate_G_acc = validate_with_label(generators[G_rank[0]], val_xes[G_rank[0]], val_y, val_labels[G_rank[0]])
-
+                validate_G_loss, validate_G_acc, _ = validate_with_label(generators[G_rank[0]],
+                                                                         discriminators[D_rank[0]], val_xes[G_rank[0]],
+                                                                         val_y_gan[G_rank[0]], val_label_gan[G_rank[0]],
+                                                                         adv_criterion)
+                logging.info(
+                    f"Cross finetune Sub-Epoch [{e + 1}/{cross_finetune_epochs}]: MSE {validate_G_loss:.8f}, Acc {validate_G_acc * 100:.2f}%")
                 if validate_G_loss >= cross_best_Gloss:
                     generators[G_rank[0]].load_state_dict(best_model_state[G_rank[0]])
                     break
-                elif validate_G_loss < cross_best_Gloss:
+                else:
                     cross_best_Gloss = validate_G_loss
-                    best_mse[G_rank[0]] = cross_best_Gloss
-                    best_model_state[G_rank[0]] = copy.deepcopy(generators[G_rank[0]].state_dict())
+                    best_model_state[G_rank[0]] = copy.deepcopy(generators[G_rank[0]].state_dict());
                     best_epoch[G_rank[0]] = epoch + 1
+                    if args.monitor_metric == 'val_mse':
+                        best_monitor_metric[G_rank[0]] = validate_G_loss.item()
+                    elif args.monitor_metric == 'val_acc':
+                        best_monitor_metric[G_rank[0]] = validate_G_acc.item()
+            print(f"--- End Cross Finetune on Epoch {epoch + 1} ---")
 
-                print(
-                    f"== Cross finetune Epoch [{e + 1}/{num_epochs}]: G{G_rank[0] + 1} with D{D_rank[0] + 1}: Validation MSE {validate_G_loss:.8f}, Validation Acc {validate_G_acc*100:.2f}%")
-                logging.info(
-                    f"== Cross finetune Epoch [{e + 1}/{num_epochs}]: G{G_rank[0] + 1} with D{D_rank[0] + 1}: Validation MSE {validate_G_loss:.8f}, Validation Acc {validate_G_acc*100:.2f}%")  # NEW
+        if distill_epochs > 0 and (epoch + 1) % 30 == 0:
+            rank = np.argsort([hists_dict[val_loss_keys[i]][epoch] for i in range(N)])
+            print(f"--- Start Distillation on Epoch {epoch + 1} ---")
+            logging.info(f"Distill on Epoch {epoch + 1} from G{rank[0] + 1} to G{rank[-1] + 1}")
+            for e in range(distill_epochs): do_distill(rank, generators, dataloaders, optimizers_G, window_sizes,
+                                                       device)
+            print(f"--- End Distillation on Epoch {epoch + 1} ---")
 
-        # At the end of each epoch, print training losses
-        print(f"Epoch [{epoch + 1}/{num_epochs}]")
-        # Dynamically generate print string
-        log_str_mse = ", ".join(
-            f"G{i + 1}: {hists_dict[key][epoch]:.8f}"
-            for i, key in enumerate(val_loss_keys)
-        )
-        log_str_acc = ", ".join(
-            f"G{i + 1}: {hists_dict[key][epoch]*100:.2f} %"
-            for i, key in enumerate(acc_keys)
-        )
-        print(f"Validation MSE {log_str_mse}, Accuracy {log_str_acc}")
-        best_info = ", ".join([f"G{i + 1}:{best_epoch[i]}" for i in range(N)])
+        epoch_time = time.time() - epo_start
+        log_mse_str = ", ".join(f"G{i + 1}: {hists_dict[k][epoch]:.8f}" for i, k in enumerate(val_loss_keys))
+        log_acc_str = ", ".join(f"G{i + 1}: {hists_dict[k][epoch] * 100:.2f}%" for i, k in enumerate(acc_keys))
+        best_epoch_str = ", ".join(f'G{i + 1}:{best_epoch[i]}' for i in range(N))
 
-        print(f"patience counter:{patience_counter}, Best epochs | {best_info}")
-        logging.info("EPOCH %d | Validation MSE: %s | Accuracy: %s", epoch + 1, log_str_mse, log_str_acc)  # NEW
+        print(f"Epoch [{epoch + 1}/{num_epochs}] | Time: {epoch_time:.2f}s")
+        print(f"  Validation MSE -> {log_mse_str} | Validation ACC -> {log_acc_str}")
+        print(f"  Patience: {patience_counter} | Best Epochs: {best_epoch_str}")
+
+        logging.info(f"EPOCH {epoch + 1} | Validation MSE: {log_mse_str} | Accuracy: {log_acc_str}")
+
         if not any(improved):
             patience_counter += 1
         else:
             patience_counter = 0
-
         if patience_counter >= patience:
             print("Early stopping triggered.")
             break
 
-        epo_end = time.time()
-        print(f"Epoch time: {epo_end - epo_start:.4f}")
-
-    data_G = [[[] for _ in range(4)] for _ in range(N)]
-    data_D = [[[] for _ in range(4)] for _ in range(N)]
-
+    data_G, data_D = [[[] for _ in range(N + 1)] for _ in range(N)], [[[] for _ in range(N + 1)] for _ in range(N)]
     for i in range(N):
         for j in range(N + 1):
             if j < N:
-                data_G[i][j] = hists_dict[f"D{j + 1}_G{i + 1}"][:epoch]
-                data_D[i][j] = hists_dict[f"D{i + 1}_G{j + 1}"][:epoch]
-            elif j == N:
-                data_G[i][j] = hists_dict[g_keys[i]][:epoch]
-                data_D[i][j] = hists_dict[d_keys[i]][:epoch]
-
-    plot_generator_losses(data_G, output_dir)
-    plot_discriminator_losses(data_D, output_dir)
-
-    # overall G&D
-    visualize_overall_loss([data_G[i][N] for i in range(N)], [data_D[i][N] for i in range(N)], output_dir)
-
-    hist_MSE_G = [[] for _ in range(N)]
-    hist_val_loss = [[] for _ in range(N)]
-    for i in range(N):
-        hist_MSE_G[i] = hists_dict[f"MSE_G{i + 1}"][:epoch]
-        hist_val_loss[i] = hists_dict[f"val_G{i + 1}"][:epoch]
-
-    plot_mse_loss(hist_MSE_G, hist_val_loss, epoch, output_dir)
-
-    # Before outputting, first concatenate strings
-    best_info = ", ".join([f"G{i + 1}:{best_epoch[i]}" for i in range(N)])
-
-    # Print to one line at once
-    print(f"Best epochs | {best_info}")
-    logging.info(f"Best epochs | {best_info}")
-
-    # ==================== MODIFICATION START ====================
-    # Pass date_series to evaluate_best_models
+                data_G[i][j] = hists_dict[f"D{j + 1}_G{i + 1}"][:epoch + 1]; data_D[i][j] = hists_dict[
+                                                                                                f"D{i + 1}_G{j + 1}"][
+                                                                                            :epoch + 1]
+            else:
+                data_G[i][j] = hists_dict[g_keys[i]][:epoch + 1]; data_D[i][j] = hists_dict[d_keys[i]][:epoch + 1]
+    plot_generator_losses(data_G, output_dir);
+    plot_discriminator_losses(data_D, output_dir);
+    visualize_overall_loss([d[N] for d in data_G], [d[N] for d in data_D], output_dir)
+    hist_MSE_G, hist_val_loss = [hists_dict[f"MSE_G{i + 1}"][:epoch + 1] for i in range(N)], [
+        hists_dict[f"val_G{i + 1}"][:epoch + 1] for i in range(N)]
+    plot_mse_loss(hist_MSE_G, hist_val_loss, epoch + 1, output_dir);
+    logging.info(f"Best epochs | {', '.join(f'G{i + 1}:{best_epoch[i]}' for i in range(N))}")
     results = evaluate_best_models(generators, best_model_state, train_xes, train_y, val_xes, val_y, y_scaler,
-                                   output_dir, date_series=date_series)
-    # ===================== MODIFICATION END =====================
-
+                                   output_dir, window_sizes, date_series=date_series)
     return results, best_model_state
 
 
-def discriminate_fake(args, X, Y, LABELS,
-                      generators, discriminators,
-                      window_sizes, target_num,
-                      criterion, weight_matrix,
-                      device,
-                      mode):
-    assert mode in ["train_D", "train_G"]
-
+def discriminate_fake(args, X, Y, LABELS, generators, discriminators, window_sizes, target_num, adv_criterion,
+                      reg_criterion, cls_criterion, weight_matrix, device, mode):
+    assert mode in ["train_D", "train_G"];
     N = len(generators)
-
-    # discriminator output for real data
     with get_autocast_context(args.amp_dtype):
-        # Automatic Mixed Precision context
-        dis_real_outputs = [model(y, label) for (model, y, label) in zip(discriminators, Y, LABELS)]
-        outputs = [generator(x) for (generator, x) in zip(generators, X)]  # cannot be omitted
-        real_labels = [torch.ones_like(dis_real_output).to(device) for dis_real_output in dis_real_outputs]
-        fake_data_G, fake_logits_G = zip(*outputs)
-        # Assuming fake_logits_G is a list, each element is a [batch_size, num_classes] tensor
-        fake_cls_G = [torch.argmax(logit, dim=1) for logit in fake_logits_G]  # shape: [batch_size]
-
-        lossD_real = [criterion(dis_real_output, real_label) for (dis_real_output, real_label) in
-                      zip(dis_real_outputs, real_labels)]
-
+        dis_real_outputs = [m(y, l) for m, y, l in zip(discriminators, Y, LABELS)];
+        outputs = [g(x) for g, x in zip(generators, X)]
+        real_labels = [torch.ones_like(o).to(device) for o in dis_real_outputs];
+        fake_data_G, fake_logits_G = zip(*outputs);
+        fake_cls_G = [torch.argmax(logit, 1) for logit in fake_logits_G]
+        lossD_real = [adv_criterion(o, r) for o, r in zip(dis_real_outputs, real_labels)]
     if mode == "train_D":
-        # Data generated by G1
-        fake_data_temp_G = [fake_data.detach() for fake_data in fake_data_G]
-        # After concatenation, the generated fake data can include both fake and real data.
-        fake_data_temp_G = [torch.cat([label[:, :window_size, :], fake_data.reshape(-1, 1, target_num)], axis=1)
-                            for (label, window_size, fake_data) in zip(Y, window_sizes, fake_data_temp_G)]
-        # CLS logits generated by G1
-        fake_cls_temp_G = [fake_logits.detach() for fake_logits in fake_cls_G]
-        # After concatenation, the generated fake data can include both fake and real data.
-        fake_cls_temp_G = [torch.cat([label[:, :window_size, :], fake_cls.reshape(-1, 1, target_num)], axis=1)
-                           for (label, window_size, fake_cls) in zip(Y, window_sizes, fake_cls_temp_G)]
+        fake_data_temp_G = [d.detach() for d in fake_data_G];
+        fake_data_temp_G = [torch.cat([l[:, :ws, :], d.reshape(-1, 1, target_num)], 1) for l, ws, d in
+                            zip(Y, window_sizes, fake_data_temp_G)]
+        fake_cls_temp_G = [c.detach() for c in fake_cls_G];
+        fake_cls_temp_G = [torch.cat([l[:, :ws, :], c.reshape(-1, 1, 1)], 1) for l, ws, c in
+                           zip(LABELS, window_sizes, fake_cls_G)]
     elif mode == "train_G":
-        # After concatenation, the generated fake data can include both fake and real data.
-        fake_data_temp_G = [torch.cat([y[:, :window_size, :], fake_data.reshape(-1, 1, target_num)], axis=1)
-                            for (y, window_size, fake_data) in zip(Y, window_sizes, fake_data_G)]
-        fake_cls_temp_G = [torch.cat([label[:, :window_size, :], fake_cls.reshape(-1, 1, target_num)], axis=1)
-                           for (label, window_size, fake_cls) in zip(LABELS, window_sizes, fake_cls_G)]
-
-    # Discriminator loss on fake data
-    # Data alignment of results from generators
-    fake_data_GtoD = {}
-    fake_cls_GtoD = {}
+        fake_data_temp_G = [torch.cat([y[:, :ws, :], d.reshape(-1, 1, target_num)], 1) for y, ws, d in
+                            zip(Y, window_sizes, fake_data_G)]
+        fake_cls_temp_G = [torch.cat([l[:, :ws, :], c.reshape(-1, 1, 1)], 1) for l, ws, c in
+                           zip(LABELS, window_sizes, fake_cls_G)]
+    fake_data_GtoD, fake_cls_GtoD = {}, {}
     for i in range(N):
         for j in range(N):
             if i < j:
                 fake_data_GtoD[f"G{i + 1}ToD{j + 1}"] = torch.cat(
-                    [Y[j][:, :window_sizes[j] - window_sizes[i], :], fake_data_temp_G[i]], axis=1)
-                fake_cls_GtoD[f"G{i + 1}ToD{j + 1}"] = torch.cat(
-                    [LABELS[j][:, :window_sizes[j] - window_sizes[i], :], fake_cls_temp_G[i]], axis=1)
+                    [Y[j][:, :window_sizes[j] - window_sizes[i], :], fake_data_temp_G[i]], 1); fake_cls_GtoD[
+                    f"G{i + 1}ToD{j + 1}"] = torch.cat(
+                    [LABELS[j][:, :window_sizes[j] - window_sizes[i], :], fake_cls_temp_G[i]], 1)
             elif i > j:
-                fake_data_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_data_temp_G[i][:, window_sizes[i] - window_sizes[j]:, :]
+                fake_data_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_data_temp_G[i][:, window_sizes[i] - window_sizes[j]:, :];
                 fake_cls_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_cls_temp_G[i][:, window_sizes[i] - window_sizes[j]:, :]
-            elif i == j:
-                fake_data_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_data_temp_G[i]
-                fake_cls_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_cls_temp_G[i]
-
-    fake_labels = [torch.zeros_like(real_label).to(device) for real_label in real_labels]
-
+            else:
+                fake_data_GtoD[f"G{i + 1}ToD{j + 1}"] = fake_data_temp_G[i]; fake_cls_GtoD[f"G{i + 1}ToD{j + 1}"] = \
+                fake_cls_temp_G[i]
+    fake_labels = [torch.zeros_like(r).to(device) for r in real_labels]
     with get_autocast_context(args.amp_dtype):
-        # Automatic Mixed Precision context
         dis_fake_outputD = []
         for i in range(N):
-            row = []
-            for j in range(N):
-                out = discriminators[i](fake_data_GtoD[f"G{j + 1}ToD{i + 1}"],
-                                        fake_cls_GtoD[f"G{j + 1}ToD{i + 1}"].long())
-                row.append(out)
-            if mode == "train_D":
-                row.append(lossD_real[i])
-            dis_fake_outputD.append(row)  # dis_fake_outputD[i][j] = Di(Gj)
-
+            row = [discriminators[i](fake_data_GtoD[f"G{j + 1}ToD{i + 1}"], fake_cls_GtoD[f"G{j + 1}ToD{i + 1}"].long())
+                   for j in range(N)]
+            if mode == "train_D": row.append(lossD_real[i])
+            dis_fake_outputD.append(row)
         if mode == "train_D":
-            loss_matrix = torch.zeros(N, N + 1, device=device)  # device depends on your model's location
-            weight = weight_matrix.clone().detach()  # [N, N+1]
+            loss_matrix = torch.zeros(N, N + 1, device=device);
+            weight = weight_matrix.clone().detach()
             for i in range(N):
-                for j in range(N + 1):
-                    if j < N:
-                        loss_matrix[i, j] = criterion(dis_fake_outputD[i][j], fake_labels[i])
-                    elif j == N:
-                        loss_matrix[i, j] = dis_fake_outputD[i][j]
+                for j in range(N + 1): loss_matrix[i, j] = adv_criterion(dis_fake_outputD[i][j],
+                                                                         fake_labels[i]) if j < N else \
+                dis_fake_outputD[i][j]
         elif mode == "train_G":
-            loss_matrix = torch.zeros(N, N, device=device)  # device depends on your model's location
-            weight = weight_matrix.clone().detach()  # [N, N]
+            loss_matrix = torch.zeros(N, N, device=device);
+            weight = weight_matrix.clone().detach()
             for i in range(N):
-                for j in range(N):
-                    loss_matrix[i, j] = criterion(dis_fake_outputD[i][j], real_labels[i])
-
-        loss_DorG = torch.multiply(weight, loss_matrix).sum(dim=1)  # [N, N] --> [N, ]
-
+                for j in range(N): loss_matrix[i, j] = adv_criterion(dis_fake_outputD[i][j], real_labels[i])
+        loss_DorG = torch.multiply(weight, loss_matrix).sum(dim=1)
         if mode == "train_G":
-            loss_mse_G = [F.mse_loss(fake_data.squeeze(), y[:, -1, :].squeeze()) for (fake_data, y) in
-                          zip(fake_data_G, Y)]
-            loss_matrix = loss_mse_G
-            loss_DorG = loss_DorG + torch.stack(loss_matrix).to(device)
-            # ---------------- Add Classification Loss -----------------
-            # Calculate cross-entropy loss for the classification branch of each generator
-            # LABELS passed as true labels (assuming its shape matches the first dimension of fake_data_cls[i])
-            cls_losses = [F.cross_entropy(fake_cls, l[:, -1, :].squeeze()) for (fake_cls, l) in
-                          zip(fake_logits_G, LABELS)]
-            # Can take average or sum (average is taken here)
-            classification_loss = torch.stack(cls_losses)
-            # Combine generator loss: original loss plus classification loss
-            loss_DorG = loss_DorG + classification_loss
-            # --------------------------------------------------
-
+            loss_reg_G = [reg_criterion(d.squeeze(), y[:, -1, :].squeeze()) for d, y in zip(fake_data_G, Y)];
+            loss_matrix = loss_reg_G;
+            loss_DorG += torch.stack(loss_reg_G).to(device)
+            cls_losses = [cls_criterion(c, l[:, -1, :].squeeze()) for c, l in zip(fake_logits_G, LABELS)];
+            loss_DorG += torch.stack(cls_losses)
     return loss_DorG, loss_matrix
 
 
-def do_distill(rank, generators, dataloaders, optimizers, window_sizes, device,
-               *,
-               alpha: float = 0.3,  # Soft target weight
-               temperature: float = 2.0,  # Temperature coefficient
-               grad_clip: float = 1.0,  # Gradient clipping limit (L2-norm)
-               mse_lambda: float = 0.8,
-               ):
-    teacher_generator = generators[rank[0]]  # Teacher generator is ranked first
-    student_generator = generators[rank[-1]]  # Student generator is ranked last
-    student_optimizer = optimizers[rank[-1]]
-    teacher_generator.eval()
-    student_generator.train()
-    # term of teacher is longer
-    if window_sizes[rank[0]] > window_sizes[rank[-1]]:
-        distill_dataloader = dataloaders[rank[0]]
-    else:
-        distill_dataloader = dataloaders[rank[-1]]
+def do_distill(rank, generators, dataloaders, optimizers, window_sizes, device, *, alpha=0.3, temperature=2.0,
+               grad_clip=1.0, mse_lambda=0.8):
+    teacher, student, opt = generators[rank[0]], generators[rank[-1]], optimizers[rank[-1]];
+    teacher.eval();
+    student.train()
+    loader = dataloaders[rank[0]] if window_sizes[rank[0]] > window_sizes[rank[-1]] else dataloaders[rank[-1]]
     gap = window_sizes[rank[0]] - window_sizes[rank[-1]]
-    # Distillation process: Teacher generator to Student generator
-    for batch_idx, (x, y, label) in enumerate(distill_dataloader):
-
-        y = y[:, -1, :]
-        y = y.to(device)
-        label = label[:, -1]
-        label = label.to(device)
-        if gap > 0:
-            x_teacher = x
-            x_student = x[:, gap:, :]
-        else:
-            x_teacher = x[:, (-1) * gap:, :]
-            x_student = x
-        x_teacher = x_teacher.to(device)
-        x_student = x_student.to(device)
-
-        # Forward pass with teacher generator
-        teacher_output, teacher_cls = teacher_generator(x_teacher)
-        teacher_output, teacher_cls = teacher_output.detach(), teacher_cls.detach()
-        # Forward pass with student generator
-        student_output, student_cls = student_generator(x_student)
-
-        # # Calculate distillation loss (MSE between teacher and student generator's outputs)
-        # soft_loss = mse_lambda * F.mse_loss(student_output, teacher_output) * (alpha * temperature ** 2)
-        # hard_loss = F.mse_loss(student_output * temperature, y) * (1 - alpha)
-        # distillation_loss = soft_loss + hard_loss
-
-        # Calculate softmax distribution after applying temperature scaling
-        teacher_soft = F.softmax(teacher_cls.detach() / temperature, dim=1)
-        student_log_soft = F.log_softmax(student_cls / temperature, dim=1)
-
-        # Soft label learning loss: KL divergence
-        soft_loss = F.kl_div(student_log_soft, teacher_soft, reduction="batchmean") * (alpha * temperature ** 2)
-
-        label_onehot = F.one_hot(label.long(), num_classes=student_cls.size(1)).float()
-
-        # Hard target loss: calculate cross-entropy between student classification output and true labels
-        hard_loss = nn.BCEWithLogitsLoss()(student_cls, label_onehot) * (1 - alpha)
-        hard_loss += F.mse_loss(student_output * temperature, y) * (1 - alpha) * mse_lambda
-        distillation_loss = soft_loss + hard_loss
-
-        # Backpropagate the loss and update student generator
-        student_optimizer.zero_grad()
-        # distillation_loss.backward()
-        scaler.scale(distillation_loss).backward()
-
-        if grad_clip is not None:
-            clip_grad_norm_(student_generator.parameters(), grad_clip)
-
-        # student_optimizer.step()  # Assuming same optimizer for all generators, modify as needed
-        scaler.step(student_optimizer)
+    for x, y, label in loader:
+        y, label = y[:, -1, :].to(device), label[:, -1].to(device)
+        x_t, x_s = (x, x[:, gap:, :]) if gap > 0 else (x[:, -gap:, :], x);
+        x_t, x_s = x_t.to(device), x_s.to(device)
+        t_out, t_cls = teacher(x_t);
+        t_out, t_cls = t_out.detach(), t_cls.detach()
+        s_out, s_cls = student(x_s)
+        soft_loss = F.kl_div(F.log_softmax(s_cls / temperature, 1), F.softmax(t_cls / temperature, 1),
+                             reduction="batchmean") * (alpha * temperature ** 2)
+        hard_loss = nn.BCEWithLogitsLoss()(s_cls, F.one_hot(label.long(), s_cls.size(1)).float()) * (
+                    1 - alpha) + F.mse_loss(s_out * temperature, y) * (1 - alpha) * mse_lambda
+        distill_loss = soft_loss + hard_loss
+        opt.zero_grad();
+        scaler.scale(distill_loss).backward()
+        if grad_clip: clip_grad_norm_(student.parameters(), grad_clip)
+        scaler.step(opt);
         scaler.update()

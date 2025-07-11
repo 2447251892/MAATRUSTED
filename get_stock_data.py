@@ -32,18 +32,18 @@ USE_ADJUSTED_DATA = True
 INDICATOR_WARMUP_PERIOD = 240
 
 # 数据获取时间范围
-TRAIN_DATA_FETCH_START_DATE = '20130101'
+TRAIN_DATA_FETCH_START_DATE = '20120101'
 USER_TRAIN_END_DATE = '20250630'
 
 # 新增:预测数据用户自定义结束日期
 PREDICT_DATA_USER_END_DATE = 'latest'
 
 stock_info_dict = {
-    "物联网": ["远望谷", "东信和平"],
-    # "军工": ["长城军工", "烽火电子", "中兵红箭"],
+    #"物联网": ["远望谷", "东信和平"],
+    #"军工": ["长城军工", "烽火电子", "中兵红箭"],
     "培育钻石": ["黄河旋风"],
     "港口": ["凤凰航运"],
-    "传媒": ["新华传媒", "吉视传媒"], # 添加了几个股票以便测试多只获取
+    #"传媒": ["新华传媒", "吉视传媒"], # 添加了几个股票以便测试多只获取
     # "零售": ["全新好", "永辉超市", "中百集团", "东百集团"],
 }
 
@@ -142,15 +142,15 @@ def calculate_technical_indicators(df_input: pd.DataFrame) -> pd.DataFrame:
         indicators_dict['sma_20'] = talib.SMA(cl, timeperiod=20)
         indicators_dict['sma_30'] = talib.SMA(cl, timeperiod=30)
         indicators_dict['sma_60'] = talib.SMA(cl, timeperiod=60)
-        indicators_dict['sma_120'] = talib.SMA(cl, timeperiod=120)
-        indicators_dict['sma_240'] = talib.SMA(cl, timeperiod=240)
+        #indicators_dict['sma_120'] = talib.SMA(cl, timeperiod=120)
+        #indicators_dict['sma_240'] = talib.SMA(cl, timeperiod=240)
         indicators_dict['ema_5'] = talib.EMA(cl, timeperiod=5)
         indicators_dict['ema_10'] = talib.EMA(cl, timeperiod=10)
         indicators_dict['ema_20'] = talib.EMA(cl, timeperiod=20)
         indicators_dict['ema_30'] = talib.EMA(cl, timeperiod=30)
         indicators_dict['ema_60'] = talib.EMA(cl, timeperiod=60)
-        indicators_dict['ema_120'] = talib.EMA(cl, timeperiod=120)
-        indicators_dict['ema_240'] = talib.EMA(cl, timeperiod=240)
+        #indicators_dict['ema_120'] = talib.EMA(cl, timeperiod=120)
+        #indicators_dict['ema_240'] = talib.EMA(cl, timeperiod=240)
 
         # 原始MACD (12, 26, 9)
         macd_dif, macd_dea, macd_hist = talib.MACD(cl, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -201,54 +201,7 @@ def calculate_technical_indicators(df_input: pd.DataFrame) -> pd.DataFrame:
         indicators_dict['obv'] = talib.OBV(cl, vo)
         indicators_dict['ad_line'] = talib.AD(hi, lo, cl, vo)
 
-        # --- 4. 高频与短期行为特征 ---
-        # pct_change = cl.pct_change() # 不再在这里重新计算，使用传入的pctChg
-        indicators_dict['pct_change'] = pct_change  # 直接使用传入的pctChg
 
-        # 注意：连续上涨/下跌天数、最大涨跌幅、range_avg_3d、pos_in_Nd_range、ema_div_ema 等指标会基于复权后的价格计算
-        is_up = (cl > op).astype(int)
-        consecutive_up_days = is_up.groupby((is_up != is_up.shift()).cumsum()).cumcount() + 1
-        indicators_dict['consecutive_up_days'] = consecutive_up_days * is_up
-        is_down = (cl < op).astype(int)
-        consecutive_down_days = is_down.groupby((is_down != is_down.shift()).cumsum()).cumcount() + 1
-        indicators_dict['consecutive_down_days'] = consecutive_down_days * is_down
-
-        # 基于复权后的pctChg计算滚动指标
-        indicators_dict['max_gain_3d'] = pct_change.rolling(window=3).max()
-        indicators_dict['max_loss_3d'] = pct_change.rolling(window=3).min()
-
-        rolling_high_5d = cl.rolling(window=5).max()
-        indicators_dict['break_high_5d_count'] = (cl >= rolling_high_5d).rolling(window=5).sum()
-        indicators_dict['range_avg_3d'] = (hi - lo).rolling(window=3).mean()
-
-        # --- 5. 价格多周期相对位置 ---
-        for n in [5, 10, 20, 60]:
-            rolling_low = lo.rolling(window=n).min()
-            rolling_high = hi.rolling(window=n).max()
-            indicators_dict[f'pos_in_{n}d_range'] = (cl - rolling_low) / (rolling_high - rolling_low + 1e-9)
-
-        indicators_dict['ema5_div_ema20'] = (indicators_dict['ema_5'] / (indicators_dict['ema_20'] + 1e-9)) - 1
-        indicators_dict['ema20_div_ema60'] = (indicators_dict['ema_20'] / (indicators_dict['ema_60'] + 1e-9)) - 1
-
-        # --- 6. 成交量精细化特征 ---
-        indicators_dict['vol_roc_10'] = talib.ROC(vo, timeperiod=10)
-        indicators_dict['pv_consistency'] = np.sign(pct_change) * np.sign(vo.pct_change())  # 使用复权后的pct_change
-        indicators_dict['obv_roc_10'] = talib.ROC(indicators_dict['obv'], timeperiod=10)
-
-        # --- 7. 波动性高级衡量 ---
-        indicators_dict['sharpe_like_20d'] = (pct_change.rolling(window=20).mean()) / (
-                pct_change.rolling(window=20).std() + 1e-9)  # 使用复权后的pct_change
-        indicators_dict['skew_20d'] = pct_change.rolling(window=20).skew()  # 使用复权后的pct_change
-        indicators_dict['kurt_20d'] = pct_change.rolling(window=20).kurt()  # 使用复权后的pct_change
-
-        # --- 8. K线实体特征 ---
-        indicators_dict['body_size'] = abs(cl - op)
-        indicators_dict['upper_shadow'] = hi - np.maximum(op, cl)
-        indicators_dict['lower_shadow'] = np.minimum(op, cl) - lo
-        indicators_dict['close_pos_in_day_range'] = (cl - lo) / (hi - lo + 1e-9)
-
-        # --- 9. K线形态 (自动识别) ---
-        #暂时删去
 
         indicators_df = pd.DataFrame(indicators_dict, index=df.index)
         df_with_indicators = pd.concat([df, indicators_df], axis=1)
@@ -526,10 +479,12 @@ def fetch_and_process_stock_data(ts_code: str,
             df_with_adj.sort_values(by='trade_date_dt', inplace=True)
 
             # 核心修复：填充缺失的复权因子
-            # 1. 向前填充，处理停牌日
+            # 推荐的修改
+            # 1. 先用 bfill() 向后填充，用第一个有效因子填充最开始的 NaN
+            df_with_adj['adj_factor'].fillna(method='bfill', inplace=True)
+
+            # 2. 再用 ffill() 向前填充，处理中间的停牌日等 NaN
             df_with_adj['adj_factor'].fillna(method='ffill', inplace=True)
-            # 2. 向后填充（处理数据最开头的缺失），用 1.0 填充，假设在那之前没有复权
-            df_with_adj['adj_factor'].fillna(1.0, inplace=True)
 
             # 转换为数值类型，errors='coerce' 将非数字转换为 NaN
             for col in ['open', 'high', 'low', 'close', 'pre_close']:

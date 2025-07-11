@@ -1,6 +1,6 @@
 # from .model import Generator_gru, Generator_lstm, Generator_transformer, Generator_rnn, Discriminator1, Discriminator2, Discriminator3
 # from .model_with_clsHead import Generator_gru, Generator_lstm, Generator_transformer, Generator_rnn, Discriminator3
-from .model_with_clsdisc import Generator_gru, Generator_lstm, Generator_transformer, Generator_rnn, Discriminator3
+from .model_with_clsdisc import Generator_gru, Generator_lstm, Generator_transformer, Generator_transformer_deep, Generator_rnn, Discriminator3, Generator_dct
 
 # __all__ = [
 #     "Generator_gru",
@@ -15,6 +15,8 @@ __all__ = [
     "Generator_gru",
     "Generator_lstm",
     "Generator_transformer",
+    "Generator_transformer_deep",
     "Generator_rnn",
-    "Discriminator3"
+    "Discriminator3",
+    "Generator_dct"
 ]
