@@ -35,8 +35,11 @@ def run_experiment_for_stock(args, stock_csv_path):
     stock_name = path_parts[-2]
     sector_name = path_parts[-3]
 
+    # 统一的实验根目录，例如 output/multi_gan/板块/个股/
     experiment_base_dir = os.path.join(args.output_dir, sector_name, stock_name)
+    # 正式训练的模型保存在其下的 ckpt 子目录
     stock_specific_ckpt_dir = os.path.join(experiment_base_dir, 'ckpt')
+    # 其他输出（如日志、可视化图表）直接放在实验根目录
     stock_specific_output_dir = experiment_base_dir
 
     os.makedirs(stock_specific_output_dir, exist_ok=True)
@@ -51,7 +54,7 @@ def run_experiment_for_stock(args, stock_csv_path):
     local_args.output_dir = stock_specific_output_dir
     local_args.ckpt_dir = stock_specific_ckpt_dir
 
-    # 实例化 MAA_time_series，已移除 train_split 参数
+    # 实例化 MAA_time_series
     gca = MAA_time_series(local_args,
                           local_args.N_pairs, local_args.batch_size, local_args.num_epochs,
                           local_args.generators, local_args.discriminators,
@@ -64,12 +67,32 @@ def run_experiment_for_stock(args, stock_csv_path):
                           device=local_args.device,
                           seed=local_args.random_seed)
 
+    # ==================== 新增: 个股CAE预训练触发逻辑 ====================
+    if 'mpd' in local_args.generators and local_args.pretrain_cae:
+        # CAE权重路径现在是相对于个股的输出目录
+        cae_ckpt_path_stock = os.path.join(stock_specific_output_dir, local_args.cae_ckpt_filename)
+        if os.path.exists(cae_ckpt_path_stock):
+            print(f"\n--- 已找到该股票的预训练CAE权重 '{cae_ckpt_path_stock}'，跳过预训练。 ---")
+        else:
+            print(f"\n--- 未找到该股票的预训练CAE权重，将仅使用当前股票数据进行预训练... ---")
+            # 调用预训练方法，只传入当前股票的CSV文件
+            gca.pretrain_cae_if_needed(
+                all_stock_files=[stock_csv_path],  # 只用自己的数据
+                cae_ckpt_path=cae_ckpt_path_stock,
+                pretrain_epochs=local_args.pretrain_cae_epochs
+            )
+            print(f"--- {stock_name} 的CAE预训练完成。权重已保存至 '{cae_ckpt_path_stock}'。 ---")
+        # 将动态生成的、个股专属的CAE权重路径更新到参数中，以便后续加载
+        local_args.cae_ckpt_path = cae_ckpt_path_stock
+    # ========================== 预训练逻辑结束 ==========================
+
+    # --- 后续流程使用更新后的 local_args ---
+
+    # 加载和处理数据
     full_df_path = stock_csv_path
     full_df = pd.read_csv(full_df_path, usecols=['date'])
     date_series = pd.to_datetime(full_df['date'], format='%Y%m%d')
-
     predict_csv_path = stock_csv_path.replace(os.path.join('train'), os.path.join('predict'))
-
     gca.process_data(
         train_csv_path=stock_csv_path,
         predict_csv_path=predict_csv_path,
@@ -77,6 +100,7 @@ def run_experiment_for_stock(args, stock_csv_path):
         exclude_columns=['date', 'direction']
     )
 
+    # 初始化数据加载器和模型（init_model会在这里加载预训练权重）
     gca.init_dataloader()
     gca.init_model(local_args.num_classes)
 
@@ -90,9 +114,7 @@ def run_experiment_for_stock(args, stock_csv_path):
             print("\n--- 训练结束，保存相关产物 ---")
 
             gca.save_models(best_model_state)
-
             gca.save_scalers()
-
             gca.generate_and_save_daily_signals(best_model_state, predict_csv_path)
 
             print("\n--- 加载最佳模型以生成预测对比CSV ---")
@@ -112,6 +134,7 @@ def run_experiment_for_stock(args, stock_csv_path):
         results = gca.pred(date_series=date_series)
 
     if results:
+        # 注意：这里的主结果文件还是保存在全局output_dir下，便于统一查看
         master_results_file = os.path.join(args.output_dir, "master_results.csv")
         timestamp_for_log = time.strftime("%Y%m%d-%H%M%S")
         result_row = {

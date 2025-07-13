@@ -2,11 +2,12 @@
 
 from MAA_base import MAABase
 import torch
+import torch.nn as nn
 import numpy as np
 from functools import wraps
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, ConcatDataset
 from utils.multiGAN_trainer_disccls import train_multi_gan
 from typing import List, Optional
 import models
@@ -18,6 +19,8 @@ import joblib
 import sys
 import logging
 import traceback
+from tqdm import tqdm
+
 
 def log_execution_time(func):
     @wraps(func)
@@ -29,6 +32,26 @@ def log_execution_time(func):
         return result
 
     return wrapper
+
+
+class CAE_for_pretrain(nn.Module):
+    def __init__(self, input_height, input_width):
+        super().__init__()
+        self.encoder = models.Generator_mpd(input_height, input_width, num_classes=3).cae_encoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(16, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.AdaptiveAvgPool2d((input_height, input_width)),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
 
 def generate_labels(y):
@@ -60,14 +83,70 @@ class MAA_time_series(MAABase):
             if isinstance(obj, type) and issubclass(obj, torch.nn.Module):
                 lname = name.lower()
                 if "generator" in lname:
-                    if name == "Generator_dct":
-                        self.generator_dict["dct"] = obj
-                    elif name.startswith("Generator_"):
-                        self.generator_dict[lname.replace("generator_", "")] = obj
+                    self.generator_dict[lname.replace("generator_", "")] = obj
                 elif "discriminator" in lname and name.startswith("Discriminator"):
                     self.discriminator_dict[lname.replace("discriminator", "")] = obj
         self.gan_weights = gan_weights;
         self.init_hyperparameters()
+
+    def pretrain_cae_if_needed(self, all_stock_files: List[str], cae_ckpt_path: str, pretrain_epochs: int):
+        all_datasets = []
+        window_size = self.window_sizes[0]
+
+        temp_df = pd.read_csv(all_stock_files[0])
+        temp_feature_cols = [col for col in temp_df.columns if col not in ['date', 'direction']]
+        num_features = len(temp_feature_cols)
+
+        for stock_file in tqdm(all_stock_files, desc="为CAE预训练加载数据"):
+            df = pd.read_csv(stock_file)
+            features = df[temp_feature_cols].values
+
+            scaler = MinMaxScaler(feature_range=(0, 1))
+            scaled_features = scaler.fit_transform(features)
+
+            images = []
+            for i in range(window_size, len(scaled_features)):
+                image_data = scaled_features[i - window_size: i, :].reshape(1, window_size, num_features)
+                images.append(image_data)
+
+            if images:
+                all_datasets.append(TensorDataset(torch.from_numpy(np.array(images)).float()))
+
+        if not all_datasets:
+            print("错误: 未能为CAE预训练创建任何数据。")
+            return
+
+        full_dataset = ConcatDataset(all_datasets)
+        dataloader = DataLoader(full_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+        cae_model = CAE_for_pretrain(input_height=window_size, input_width=num_features).to(self.device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(cae_model.parameters(), lr=1e-3)
+
+        cae_model.train()
+
+        with tqdm(total=pretrain_epochs * len(dataloader), desc="CAE预训练") as pbar:
+            for epoch in range(pretrain_epochs):
+                epoch_loss = 0.0
+                for batch_idx, batch in enumerate(dataloader):
+                    images = batch[0].to(self.device)
+
+                    optimizer.zero_grad()
+                    outputs = cae_model(images)
+                    loss = criterion(outputs, images)
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item()
+
+                    pbar.set_postfix(
+                        Epoch=f'{epoch + 1}/{pretrain_epochs}',
+                        Loss=f'{epoch_loss / (batch_idx + 1):.6f}'
+                    )
+                    pbar.update(1)
+
+        os.makedirs(os.path.dirname(cae_ckpt_path), exist_ok=True)
+        torch.save(cae_model.encoder.state_dict(), cae_ckpt_path)
 
     @log_execution_time
     def process_data(self, train_csv_path, predict_csv_path, target_column, exclude_columns):
@@ -105,40 +184,61 @@ class MAA_time_series(MAABase):
             f"数据加载、划分和归一化完成。训练集: {len(self.train_y)} 条, 验证集: {len(self.val_y)} 条, 测试集: {len(self.test_y)} 条。")
 
     def create_sequences_combine(self, x, y, label, window_size, start):
-        x_, y_, y_gan, label_gan = [], [], [], [];
+        x_seq, y_reg, y_gan, label_gan = [], [], [], []
+        x_img = []
+        num_features = x.shape[1]
         for i in range(start, x.shape[0]):
-            x_.append(x[i - window_size: i, :]);
-            y_.append(y[i]);
-            y_gan.append(y[i - window_size: i + 1]);
+            x_seq.append(x[i - window_size: i, :])
+            y_reg.append(y[i])
+            y_gan.append(y[i - window_size: i + 1])
             label_gan.append(label[i - window_size: i + 1])
-        return (torch.from_numpy(np.array(x_)).float(), torch.from_numpy(np.array(y_)).float(),
-                torch.from_numpy(np.array(y_gan)).float(), torch.from_numpy(np.array(label_gan)).float())
+            image_data = x[i - window_size: i, :].reshape(1, window_size, num_features)
+            x_img.append(image_data)
+        return (
+            torch.from_numpy(np.array(x_seq)).float(),
+            torch.from_numpy(np.array(x_img)).float(),
+            torch.from_numpy(np.array(y_reg)).float(),
+            torch.from_numpy(np.array(y_gan)).float(),
+            torch.from_numpy(np.array(label_gan)).long()
+        )
 
     @log_execution_time
     def init_dataloader(self):
-        ws = self.window_sizes;
+        ws = self.window_sizes
         train_data = [self.create_sequences_combine(self.train_x_list[i], self.train_y, self.train_labels, w, ws[-1])
                       for i, w in enumerate(ws)]
         val_data = [self.create_sequences_combine(self.val_x_list[i], self.val_y, self.val_labels, w, ws[-1]) for i, w
                     in enumerate(ws)]
         test_data = [self.create_sequences_combine(self.test_x_list[i], self.test_y, self.test_labels, w, ws[-1]) for
                      i, w in enumerate(ws)]
-        self.train_x_all = [x.to(self.device) for x, _, _, _ in train_data];
-        self.train_y_all = train_data[0][1];
-        self.train_y_gan_all = [y_gan.to(self.device) for _, _, y_gan, _ in train_data];
-        self.train_label_gan_all = [l_gan.to(self.device) for _, _, _, l_gan in train_data]
-        self.val_x_all = [x.to(self.device) for x, _, _, _ in val_data];
-        self.val_y_all = val_data[0][1];
-        self.val_y_gan_all = [y_gan.to(self.device) for _, _, y_gan, _ in val_data];
-        self.val_label_gan_all = [l_gan.to(self.device) for _, _, _, l_gan in val_data]
-        self.test_x_all = [x.to(self.device) for x, _, _, _ in test_data];
-        self.test_y_all = test_data[0][1];
-        self.test_y_gan_all = [y_gan.to(self.device) for _, _, y_gan, _ in test_data];
-        self.test_label_gan_all = [l_gan.to(self.device) for _, _, _, l_gan in test_data]
-        self.dataloaders = [DataLoader(TensorDataset(x, y_gan, l_gan), batch_size=self.batch_size,
-                                       shuffle=("transformer" in self.generator_names[i]),
-                                       generator=torch.manual_seed(self.seed), drop_last=True) for i, (x, y_gan, l_gan)
-                            in enumerate(zip(self.train_x_all, self.train_y_gan_all, self.train_label_gan_all))]
+        self.train_x_all = [x_seq.to(self.device) for x_seq, _, _, _, _ in train_data]
+        self.train_x_img_all = [x_img.to(self.device) for _, x_img, _, _, _ in train_data]
+        self.train_y_all = train_data[0][2]
+        self.train_y_gan_all = [y_gan.to(self.device) for _, _, _, y_gan, _ in train_data]
+        self.train_label_gan_all = [l_gan.to(self.device) for _, _, _, _, l_gan in train_data]
+        self.val_x_all = [x_seq.to(self.device) for x_seq, _, _, _, _ in val_data]
+        self.val_x_img_all = [x_img.to(self.device) for _, x_img, _, _, _ in val_data]
+        self.val_y_all = val_data[0][2]
+        self.val_y_gan_all = [y_gan.to(self.device) for _, _, _, y_gan, _ in val_data]
+        self.val_label_gan_all = [l_gan.to(self.device) for _, _, _, _, l_gan in val_data]
+        self.test_x_all = [x_seq.to(self.device) for x_seq, _, _, _, _ in test_data]
+        self.test_x_img_all = [x_img.to(self.device) for _, x_img, _, _, _ in test_data]
+        self.test_y_all = test_data[0][2]
+        self.test_y_gan_all = [y_gan.to(self.device) for _, _, _, y_gan, _ in test_data]
+        self.test_label_gan_all = [l_gan.to(self.device) for _, _, _, _, l_gan in test_data]
+        self.dataloaders = []
+        for i in range(self.N):
+            is_mpd = "mpd" in self.generator_names[i]
+            x_data_for_loader = self.train_x_img_all[i] if is_mpd else self.train_x_all[i]
+            y_gan_data = self.train_y_gan_all[i]
+            l_gan_data = self.train_label_gan_all[i]
+            self.dataloaders.append(
+                DataLoader(TensorDataset(x_data_for_loader, y_gan_data, l_gan_data),
+                           batch_size=self.batch_size,
+                           shuffle=("transformer" in self.generator_names[i] or "mpd" in self.generator_names[i]),
+                           generator=torch.manual_seed(self.seed),
+                           drop_last=True)
+            )
 
     @log_execution_time
     def init_model(self, num_cls):
@@ -146,18 +246,48 @@ class MAA_time_series(MAABase):
         if len(self.generator_names) != self.N or len(self.window_sizes) != self.N: sys.exit(1)
         for i, name in enumerate(self.generator_names):
             if not hasattr(self, 'train_x_all') or not self.train_x_all or i >= len(self.train_x_all): sys.exit(1)
+
             input_dim, y_dim = self.train_x_all[i].shape[-1], self.train_y_all.shape[-1]
             GenClass = self.generator_dict.get(name);
             if GenClass is None: sys.exit(1)
-            if name == "transformer":
-                self.generators.append(GenClass(input_dim=input_dim, output_len=y_dim).to(self.device))
+
+            generator_instance = None
+            if name == "mpd":
+                window_size = self.window_sizes[i]
+                num_features = len(self.feature_columns)
+                generator_instance = GenClass(input_height=window_size, input_width=num_features, num_classes=num_cls)
+
+                # ==================== 修正点: 使用个股专属的路径 ====================
+                # args.cae_ckpt_path 现在是由 run_multi_gan 传入的、包含完整路径的参数
+                cae_ckpt_path_stock = self.args.cae_ckpt_path
+                # ========================== 修正结束 ==========================
+
+                if os.path.exists(cae_ckpt_path_stock):
+                    try:
+                        generator_instance.cae_encoder.load_state_dict(
+                            torch.load(cae_ckpt_path_stock, map_location=self.device))
+                        print(f"成功为 Generator_mpd (G{i + 1}) 加载了预训练的CAE编码器权重。")
+                    except Exception as e:
+                        print(f"警告: 为 G{i + 1} 加载预训练CAE编码器权重失败: {e}")
+                else:
+                    if self.args.pretrain_cae:
+                        print(
+                            f"信息: 未找到该股票的预训练权重 '{cae_ckpt_path_stock}'，将在微调时从零开始训练CAE编码器部分。")
+
+            elif name == "transformer":
+                generator_instance = GenClass(input_dim=input_dim, output_len=y_dim)
+            elif name == "transformer_deep":
+                generator_instance = GenClass(input_dim=input_dim, output_len=y_dim)
             elif name == "dct":
-                self.generators.append(
-                    GenClass(input_dim=input_dim, out_size=y_dim, num_classes=num_cls).to(self.device))
+                generator_instance = GenClass(input_dim=input_dim, out_size=y_dim, num_classes=num_cls)
             elif name == "rnn":
-                self.generators.append(GenClass(input_size=input_dim).to(self.device))
+                generator_instance = GenClass(input_size=input_dim)
             else:
-                self.generators.append(GenClass(input_size=input_dim, out_size=y_dim).to(self.device))
+                generator_instance = GenClass(input_size=input_dim, out_size=y_dim)
+
+            if generator_instance:
+                self.generators.append(generator_instance.to(self.device))
+
             DisClass = self.discriminator_dict.get("default");
             if DisClass is None: sys.exit(1)
             self.discriminators.append(
@@ -169,12 +299,30 @@ class MAA_time_series(MAABase):
                                                                          in range(self.N)]
 
     def train(self, logger, date_series=None):
-        return train_multi_gan(self.args, self.generators, self.discriminators, self.dataloaders, self.window_sizes,
-                               self.y_scaler, self.train_x_all, self.train_y_all, self.val_x_all, self.val_y_all,
-                               self.val_y_gan_all, self.val_label_gan_all, self.do_distill_epochs,
-                               self.cross_finetune_epochs, self.num_epochs, self.output_dir, self.device,
-                               init_GDweight=self.init_GDweight, final_GDweight=self.final_GDweight, logger=logger,
-                               date_series=date_series)
+        is_mpd_run = "mpd" in self.generator_names[0]
+        train_x_to_pass = self.train_x_img_all if is_mpd_run else self.train_x_all
+        val_x_to_pass = self.val_x_img_all if is_mpd_run else self.val_x_all
+
+        return train_multi_gan(
+            args=self.args,
+            generators=self.generators,
+            discriminators=self.discriminators,
+            dataloaders=self.dataloaders,
+            window_sizes=self.window_sizes,
+            y_scaler=self.y_scaler,
+            train_xes=train_x_to_pass,
+            train_y=self.train_y_all,
+            val_xes=val_x_to_pass,
+            val_y=self.val_y_all,
+            val_y_gan=self.val_y_gan_all,
+            val_label_gan=self.val_label_gan_all,
+            output_dir=self.output_dir,
+            device=self.device,
+            init_GDweight=self.init_GDweight,
+            final_GDweight=self.final_GDweight,
+            logger=logger,
+            date_series=date_series
+        )
 
     def save_models(self, best_model_state):
         gen_dir = os.path.join(self.ckpt_dir, "generators");
@@ -193,12 +341,16 @@ class MAA_time_series(MAABase):
         print("\n--- 开始生成并保存真实值 vs. 预测值对比CSV文件 (基于测试集) ---")
         if not hasattr(self, 'generators') or not hasattr(self, 'test_x_all') or not hasattr(self,
                                                                                              'test_y_all') or not self.test_x_all: return
+
+        is_mpd_run = "mpd" in self.generator_names[0]
+        test_x_to_use = self.test_x_img_all if is_mpd_run else self.test_x_all
+
         with torch.no_grad():
             for i, gen in enumerate(self.generators):
                 gen.eval();
-                if i >= len(self.test_x_all): continue
+                if i >= len(test_x_to_use): continue
                 try:
-                    y_pred_gen, _ = gen(self.test_x_all[i]);
+                    y_pred_gen, _ = gen(test_x_to_use[i]);
                     y_pred_norm = y_pred_gen.cpu().numpy().reshape(-1, 1)
                     true_y_segment = self.test_y_all[-len(y_pred_gen):];
                     y_true_norm = true_y_segment.cpu().numpy().reshape(-1, 1)
@@ -222,7 +374,8 @@ class MAA_time_series(MAABase):
                     df_out.to_csv(out_path, index=False)
                     print(f"已保存 G{i + 1} 的真实值与预测值对比: {out_path}")
                 except Exception as e:
-                    print(f"错误: 为 G{i + 1} 生成预测CSV时出错: {e}"); traceback.print_exc()
+                    print(f"错误: 为 G{i + 1} 生成预测CSV时出错: {e}");
+                    traceback.print_exc()
 
     def pred(self, date_series=None):
         print(f"开始使用以下路径的模型进行预测: {self.ckpt_dir}");
@@ -235,18 +388,26 @@ class MAA_time_series(MAABase):
             if os.path.exists(save_path):
                 try:
                     state_dict = torch.load(save_path, map_location=self.device)
-                    if i < len(self.generators) and self.generators[i].__class__.__name__.lower().replace("generator_",
-                                                                                                          "") == gen_name.lower():
+                    expected_class_name = self.generators[i].__class__.__name__.lower()
+                    if i < len(self.generators) and expected_class_name.replace("generator_", "") == gen_name.lower():
                         self.generators[i].load_state_dict(state_dict);
                         best_model_state[i] = state_dict;
                         loaded_count += 1
                 except Exception as e:
-                    print(f"错误: 加载检查点 {save_path} 失败: {e}"); traceback.print_exc()
+                    print(f"错误: 加载检查点 {save_path} 失败: {e}");
+                    traceback.print_exc()
         if loaded_count == 0: print("错误: 未能加载任何模型，无法进行预测。"); return None
         if not all(hasattr(self, attr) for attr in
                    ['train_x_all', 'test_x_all', 'train_y_all', 'test_y_all', 'y_scaler']): return None
-        results = evaluate_best_models(self.generators, best_model_state, self.train_x_all, self.train_y_all,
-                                       self.test_x_all, self.test_y_all, self.y_scaler, self.output_dir,
+
+        is_mpd_run = "mpd" in self.generator_names[0]
+        train_xes_to_eval = self.train_x_img_all if is_mpd_run else self.train_x_all
+        test_xes_to_eval = self.test_x_img_all if is_mpd_run else self.test_x_all
+
+        results = evaluate_best_models(self.generators, best_model_state,
+                                       train_xes_to_eval, self.train_y_all,
+                                       test_xes_to_eval, self.test_y_all,
+                                       self.y_scaler, self.output_dir,
                                        self.window_sizes, date_series=date_series)
         self.save_predictions_to_csv(date_series=date_series);
         return results
@@ -258,7 +419,8 @@ class MAA_time_series(MAABase):
             joblib.dump(self.y_scaler, os.path.join(self.output_dir, 'y_scaler.gz'))
             print(f"Scaler 已成功保存至: {self.output_dir}")
         except Exception as e:
-            print(f"错误: 保存 scaler 失败: {e}"); traceback.print_exc()
+            print(f"错误: 保存 scaler 失败: {e}");
+            traceback.print_exc()
 
     def generate_and_save_daily_signals(self, best_model_state, predict_csv_path):
         if not all(hasattr(self, attr) for attr in
@@ -274,10 +436,13 @@ class MAA_time_series(MAABase):
         for i, state in enumerate(best_model_state):
             if state is None: continue
             gen_name, window_size, generator = self.generator_names[i], self.window_sizes[i], self.generators[i]
+            is_mpd_model = "mpd" in gen_name
             try:
-                generator.load_state_dict(state); generator.eval()
+                generator.load_state_dict(state);
+                generator.eval()
             except Exception as e:
-                print(f"错误: 加载 G{i + 1} ({gen_name}) 状态失败: {e}"); continue
+                print(f"错误: 加载 G{i + 1} ({gen_name}) 状态失败: {e}");
+                continue
             print(f"正在处理模型: G{i + 1} ({gen_name})，窗口大小: {window_size}");
             signals = []
             for j in range(loop_start_index, len(df_predict)):
@@ -287,8 +452,15 @@ class MAA_time_series(MAABase):
                 sequence_data = df_segment[self.feature_columns].values
                 if np.isnan(sequence_data).any(): continue
                 try:
-                    scaled_sequence = x_scaler.transform(sequence_data);
-                    input_tensor = torch.from_numpy(np.array([scaled_sequence])).float().to(self.device)
+                    scaled_sequence = x_scaler.transform(sequence_data)
+                    if is_mpd_model:
+                        num_features = scaled_sequence.shape[1]
+                        input_data = scaled_sequence.reshape(1, 1, window_size, num_features)
+                    else:
+                        input_data = np.array([scaled_sequence])
+
+                    input_tensor = torch.from_numpy(input_data).float().to(self.device)
+
                     with torch.no_grad():
                         gen_output, logits = generator(input_tensor);
                         predicted_action = logits.argmax(dim=1).item()

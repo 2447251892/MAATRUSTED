@@ -1,4 +1,4 @@
-# 文件名: experiment_runner.py
+# 文件名: experiment_runner.py (已修改以确保批量运行的可复现性)
 
 import argparse
 import torch
@@ -9,6 +9,29 @@ import pandas as pd
 import logging
 # 导入功能模块
 import run_multi_gan
+import random
+import numpy as np
+
+
+# ==============================================================================
+# 独立的、可重用的设置随机种子的函数
+# ==============================================================================
+def set_seed(seed):
+    """
+    为所有相关的随机数生成器设置种子，以确保实验的可复现性。
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)  # 适用于多GPU环境
+            # 这两行是确保CUDA运算可复现性的关键
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        print(f"--- 随机种子已设置为: {seed} ---")
+
 
 # ==============================================================================
 # 默认参数配置中心 (COMMON_ARGS)
@@ -18,17 +41,17 @@ COMMON_ARGS = {
     "sector": None,
     "data_base_dir": "csv_data",
     "output_dir": "output/multi_gan",
-    "ckpt_dir": "ckpt/multi_gan",
+    "ckpt_dir": "ckpt/multi_gan",  # 注意：这个现在只作为全局的根目录，具体路径在run_multi_gan中拼接
     "notes": "Default run from COMMON_ARGS",
     "window_sizes": [5, 10, 15],
     "N_pairs": 3,
     "num_classes": 3,
-    "generators": ["gru", "lstm", "transformer"],
+    "generators": ["gru", "bilstm", "transformer"],
     "discriminators": None,
     "distill_epochs": 1,
     "cross_finetune_epochs": 5,
     "num_epochs": 200,
-    "lr": 2e-05,
+    "lr": 2e-5,
     "batch_size": 64,
     "train_val_test_split": [0.7, 0.1, 0.2],
     "random_seed": 3407,
@@ -38,9 +61,16 @@ COMMON_ARGS = {
     "ckpt_path": "auto",
 
     # 损失函数配置
-    "adversarial_loss_mode": "bce",  # 可选 'bce', 'mse'
-    "regression_loss_mode": "mse",  # 可选 'mse', 'mae'
-    "monitor_metric": "val_mse",  # 可选 'val_mse', 'val_acc', 'val_bce'
+    "adversarial_loss_mode": "bce",
+    "regression_loss_mode": "mse",
+    "monitor_metric": "val_mse",
+
+    # CAE预训练相关参数
+    "pretrain_cae": True,
+    "pretrain_cae_epochs": 50,
+    # CAE权重现在是相对于每个股票的输出目录，所以这里只保留文件名
+    "cae_ckpt_filename": "cae_encoder_pretrained.pt",
+    "lr_cae_finetune_multiplier": 0.5,
 }
 
 
@@ -58,10 +88,10 @@ def setup_arg_parser():
             parser.add_argument(f'--{key}', type=type(value[0]) if value else str, nargs='+', default=value,
                                 help=f"默认为: {value}")
         elif isinstance(value, bool):
-            if value is True:
-                parser.add_argument(f'--{key}', action='store_false', default=value, help=f"设置此项以禁用 {key}")
-            else:
-                parser.add_argument(f'--{key}', action='store_true', default=value, help=f"设置此项以激活 {key}")
+            group = parser.add_mutually_exclusive_group(required=False)
+            group.add_argument(f'--{key}', dest=key, action='store_true', help=f"激活 {key} (默认为: {value})")
+            group.add_argument(f'--no-{key}', dest=key, action='store_false', help=f"禁用 {key}")
+            parser.set_defaults(**{key: value})
         else:
             arg_type = type(value) if value is not None else str
             parser.add_argument(f'--{key}', type=arg_type, default=value,
@@ -70,6 +100,7 @@ def setup_arg_parser():
 
 
 def validate_args(args):
+    # ... (此函数保持不变)
     if len(args.generators) != args.N_pairs or len(args.window_sizes) != args.N_pairs:
         print("错误: --generators, --window_sizes, 和 --N_pairs 的数量必须一致!")
         sys.exit(1)
@@ -97,14 +128,13 @@ def validate_args(args):
     valid_loss_modes = ['bce', 'mse', 'mae']
     if args.adversarial_loss_mode not in valid_loss_modes or args.regression_loss_mode not in valid_loss_modes:
         print(f"警告: 无效的损失函数模式。可选值: {valid_loss_modes}")
-    if args.monitor_metric not in ['val_mse', 'val_acc', 'val_bce']:
-        print(f"警告: 无效的监控指标。可选值: 'val_mse', 'val_acc', 'val_bce'")
+    if args.monitor_metric not in ['val_mse', 'val_acc', 'val_bce', 'val_cls_loss']:
+        print(f"警告: 无效的监控指标。可选值: 'val_mse', 'val_acc', 'val_bce', 'val_cls_loss'")
 
     return args
 
 
 # ==============================================================================
-
 
 def main():
     logging.basicConfig(
@@ -121,6 +151,9 @@ def main():
     args = parser.parse_args()
     args = validate_args(args)
 
+    # 在所有操作开始前，先全局设置一次随机种子
+    set_seed(args.random_seed)
+
     print("===== 当前最终运行参数 (已合并默认值和命令行参数) =====")
     for arg, value in vars(args).items():
         print(f"{arg}: {value}")
@@ -133,7 +166,15 @@ def main():
 
     print(f"\n成功找到 {len(stock_files_to_process)} 个股票数据文件待处理。")
 
+    # 预训练逻辑已从此文件移除，交由 run_multi_gan.py 处理
+
     for stock_file in stock_files_to_process:
+
+        # ==================== 核心修改点 ====================
+        # 在处理每只新股票之前，都重置一次随机种子，以确保实验之间的独立性和可复现性。
+        set_seed(args.random_seed)
+        # ====================================================
+
         path_parts = stock_file.replace('\\', '/').split('/')
         stock_name_from_path = path_parts[-2]
         sector_name_from_path = path_parts[-3]
@@ -150,6 +191,7 @@ def main():
                     f"\n--- 找到股票 {stock_name_from_path} 的目录 {expected_output_dir}，但未找到检查点，将尝试重新运行。 ---")
 
         try:
+            # 直接将所有参数传递给单次实验执行器
             run_multi_gan.run_experiment_for_stock(args, stock_file)
 
         except Exception as e:

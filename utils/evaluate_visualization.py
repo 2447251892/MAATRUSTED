@@ -11,7 +11,6 @@ import logging
 import pandas as pd
 
 
-# --- 验证函数 ---
 def validate(model, val_x, val_y):
     model.eval()
     with torch.no_grad():
@@ -25,10 +24,9 @@ def validate(model, val_x, val_y):
         return mse_loss
 
 
-def validate_with_label(generator, discriminator, val_x, val_y_gan, val_label_gan, adv_criterion):
+def validate_with_label(generator, discriminator, val_x, val_y_gan, val_label_gan, adv_criterion, cls_criterion):
     """
-    验证模型在验证集上的MSE、分类准确率和对抗损失。
-    修复了 val_label_gan 的维度问题。
+    验证模型在验证集上的MSE、分类准确率、对抗损失和分类损失。
     """
     generator.eval()
     discriminator.eval()
@@ -36,33 +34,27 @@ def validate_with_label(generator, discriminator, val_x, val_y_gan, val_label_ga
     with torch.no_grad():
         device = val_x.device
 
-        # 1. 计算 MSE 和 ACC
         predictions, logits = generator(val_x)
 
         true_y_for_mse = val_y_gan[:, -1, :].squeeze()
         mse_loss = F.mse_loss(predictions.squeeze(), true_y_for_mse)
 
-        # 使用二维索引
         true_cls_for_acc = val_label_gan[:, -1].squeeze()
         pred_cls = logits.argmax(dim=1)
         acc = (pred_cls == true_cls_for_acc).float().mean()
 
-        # 2. 计算对抗损失
+        classification_loss = cls_criterion(logits, true_cls_for_acc)
+
         target_num = val_y_gan.shape[-1]
         fake_data_for_disc = torch.cat([val_y_gan[:, :-1, :], predictions.reshape(-1, 1, target_num)], axis=1)
-
-        # 调整 fake_labels_for_disc 的构造
         fake_labels_for_disc = torch.cat([val_label_gan[:, :-1], pred_cls.reshape(-1, 1)], axis=1)
-
         disc_output_on_fake = discriminator(fake_data_for_disc, fake_labels_for_disc.long())
-
         real_labels_for_loss = torch.ones_like(disc_output_on_fake).to(device)
         adversarial_loss = adv_criterion(disc_output_on_fake, real_labels_for_loss)
 
-        return mse_loss, acc, adversarial_loss
+        return mse_loss, acc, adversarial_loss, classification_loss
 
 
-# --- 绘图函数 ---
 def plot_fitting_curve(true_values, predicted_values, dates, output_dir, model_name):
     viz_output_dir = os.path.join(output_dir, "visualization")
     os.makedirs(viz_output_dir, exist_ok=True)
