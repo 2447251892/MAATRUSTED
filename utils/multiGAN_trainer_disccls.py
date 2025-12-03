@@ -1,4 +1,4 @@
-# 文件名: utils/multiGAN_trainer_disccls.py (无需修改，已具备灵活性)
+# 文件名: utils/multiGAN_trainer_disccls.py
 
 import torch.nn as nn
 import copy
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from .util import get_autocast_context
 import logging
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 import numpy as np
 import models  # 确保导入 models 模块
 
@@ -31,7 +31,7 @@ def train_multi_gan(args, generators, discriminators, dataloaders, window_sizes,
                     val_y, val_y_gan, val_label_gan, output_dir, device,
                     init_GDweight, final_GDweight, # 这两个参数将由 time_series_maa.py 动态生成并传入
                     logger=None, dynamic_weight=False, date_series=None):
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     N = len(generators)
     num_epochs = args.num_epochs
