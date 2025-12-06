@@ -1,0 +1,354 @@
+这份文档详细整理了**MAATRUSTED** 项目从 Windows 端模型导出，到 Linux 虚拟机模型转换，最后到 RK3568 板端部署的全流程操作指南，以及过程中遇到的所有关键问题与解决方案。
+
+您可以将其保存为 `DEPLOY_GUIDE.md` 或 `部署运维手册.docx`。
+
+---
+
+# MAATRUSTED 边缘端部署运维手册
+
+**适用平台**：Windows (训练/导出) -> Ubuntu 24.04 (模型转换) -> RK3568 (端侧推理)
+**核心工具**：PyTorch, ONNX, RKNN-Toolkit2, RKNN-Toolkit-Lite2, Conda
+
+---
+
+## 第一阶段：Windows 端模型导出
+
+**目标**：将训练好的 PyTorch (`.pt`) 模型导出为通用的 ONNX 格式，并提取归一化参数为 JSON。
+
+### 1. 操作步骤
+1.  **环境检查**：确保已安装 `onnx` 和 `onnxruntime` 库。
+    ```
+    pip install onnx onnxruntime
+    ```
+2.  **执行导出**：运行项目根目录下的导出脚本。
+    ```
+    python deploy_export.py
+    ```
+3.  **交互指令**：
+    *   系统会列出所有可用股票。
+    *   输入 `all` 一键导出所有模型；或输入 `1` 导出特定股票。
+4.  **产物确认**：
+    检查 `deploy_output/` 文件夹，确保生成了 `model_deploy.onnx` 和 `scaler_params.json`。
+
+### 2. 遇到的问题与解决
+
+| 问题现象 | 原因分析 | 解决方案 |
+| :--- | :--- | :--- |
+| **KeyError: 'generator_index'** | `best_metrics.csv` 文件是直接复制而来，内部缺少记录模型 ID 的列，脚本无法定位使用哪个生成器。 | **代码优化**：修改 `deploy_export.py`，增加“特征指纹匹配”逻辑，通过比对收益率和交易次数，反向在 `G*_metrics.csv` 中查找到原始模型 ID。 |
+| **Module onnx is not installed** | PyTorch 导出 ONNX 依赖底层 `onnx` 协议库，环境中未安装。 | **环境修补**：执行 `pip install onnx onnxruntime`。 |
+| **UserWarning: LSTM Batch Size...** | PyTorch 提示 LSTM 导出时 Batch Size 非 1 可能导致动态输入问题。 | **忽略**：脚本中已设置 `dynamic_axes` 支持动态输入，且推理时 Batch=1 是标准操作。代码中已添加 `warnings.filterwarnings` 屏蔽此干扰信息。 |
+
+---
+
+这是根据您最新的实战操作（Python 3.11 + 依赖文件 + Numpy版本锁定 + PyCharm集成）更新后的**第二阶段**文档。
+
+可以直接替换原文档中的对应章节。
+
+---
+
+
+
+
+## 第二阶段：Linux 虚拟机模型转换 (核心)
+
+**目标**：解决环境兼容性问题，将 `.onnx` 转换为 RK3568 NPU 可用的 `.rknn` 模型，并配置 IDE 开发环境。
+
+### 1. 环境痛点背景
+*   **OS**: Ubuntu 24.04 (默认 Python 3.12)
+*   **Requirement**: RKNN-Toolkit2 (1.6.0) 指定需要 Python 3.11 环境配合特定版本的 TensorFlow。
+*   **Dependency Trap**: 最新版 pip 默认会安装 Numpy 2.x，这会导致 RKNN 底层 C-API 崩溃，必须严格锁定 Numpy 版本。
+
+### 2. 环境搭建 (Conda 方案)
+
+#### 步骤 A: 安装 Miniconda & 配置国内源
+1.  **安装 Miniconda**：
+    ```
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+     Miniconda3-latest-Linux-x86_64.sh -b -u -p ~/miniconda3
+    ~/miniconda3/bin/conda init 
+    source ~/.rc
+    ```
+2.  **配置清华源 (解决 ToS 报错)**：
+    修改 `~/.condarc` 文件，强制劫持 `defaults` 频道：
+    ```yaml
+channels:
+  - defaults
+show_channel_urls: true
+default_channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2
+custom_channels:
+  conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  msys2: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  bioconda: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  menpo: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  pytorch: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  simpleitk: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+    ```
+
+#### 步骤 B: 创建环境并安装依赖 (关键步骤)
+**注意**：安装顺序至关重要，必须先锁定 Numpy 版本，再安装 requirements，最后安装 RKNN。
+
+1.  **创建虚拟环境**：
+    ```
+    conda create -n rknn python=3.11 -y
+    conda activate rknn
+    ```
+2.  **锁定 Numpy 版本 (防止安装 2.0)**：
+    ```
+    pip install "numpy<2.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
+    ```
+3.  **安装官方依赖列表**：
+    *(确保 `requirements_cp311-1.6.0.txt` 在当前目录)*
+    ```
+    pip install -r requirements_cp311-1.6.0.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    ```
+4.  **安装 RKNN Toolkit2**：
+    *(确保 whl 文件在当前目录)*
+    ```
+    pip install rknn_toolkit2-1.6.0+81f21f4d-cp311-cp311-linux_x86_64.whl
+    ```
+5.  **再次修正numpy**：
+    *(确保在rknn环境中)*
+    ```
+    pip uninstall numpy -y
+    pip install "numpy<2.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
+    ```
+5.  **降级opencv**（OpenCV 版本太新 (4.12)，它强制要求 Numpy 2.0 以上，而 RKNN 强制要求 Numpy 1.x）：
+    *(确保在rknn环境中)*
+    ```
+    # 1. 卸载当前的 numpy
+   pip uninstall opencv-python
+   pip install "opencv-python<4.11" -i https://pypi.tuna.tsinghua.edu.cn/simple
+    ```
+降级 OpenCV
+
+
+### 3. PyCharm IDE 配置
+1.  **启动 PyCharm**：在终端运行 `pycharm-community` 或通过图标启动。
+2.  **打开项目**：选择 `deploy_output` 或项目根目录打开。
+3.  **配置解释器**：
+    *   点击右下角解释器状态栏 -> `Add New Interpreter` -> `On Interpreter`.
+    *   选择 **Conda Environment**。
+    *   Interpreter 路径指向：`~/miniconda3/envs/rknn/bin/python`。
+    *   等待 Indexing 完成，确保代码中 `import rknn` 无红线报错。
+
+### 4. 模型转换操作
+1.  **准备数据**：确保 Windows 导出的 `deploy_output` 文件夹已完整拷贝到项目目录。
+2.  **执行转换**：在 PyCharm 中运行或终端执行：
+    ```
+    python deploy_convert_batch.py
+    ```
+    *(脚本会自动递归扫描 ONNX，生成 FP16 精度的 model.rknn)*
+
+### 5. 遇到的问题与解决
+
+| 问题现象 | 原因分析 | 解决方案 |
+| :--- | :--- | :--- |
+| **ValueError: numpy.dtype size changed** | 安装了 Numpy 2.x 版本。RKNN 的底层 C 库是基于 Numpy 1.x 编译的，ABI 不兼容。 | **版本锁定**：在安装其他依赖前，优先执行 `pip install "numpy<2.0"`。 |
+| **Could not find version that satisfies...** | Python 3.11 对旧版 TensorFlow 支持有限，直接 pip install tensorflow 可能会失败。 | **依赖清单**：使用官方提供的 `requirements_cp311-*.txt`，其中指定了兼容 Py3.11 的 TF 2.14.0。 |
+| **CondaToSNonInteractiveError** | Anaconda 官方源强制要求交互式接受服务条款。 | **换源**：修改 `~/.condarc`，移除官方 `defaults` 链接，完全替换为清华镜像源。 |
+| **模型转换精度损失** | 股票预测是数值回归任务，默认 INT8 量化会导致预测结果偏差极大。 | **配置调整**：在转换脚本中设置 `rknn.build(do_quantization=False)`，强制使用 FP16 精度。 |
+
+
+
+## 第三阶段：RK3568 板端部署
+
+**目标**：构建模型仓库，实现动态加载与 NPU 推理。
+
+### 1. 操作步骤
+1.  **文件传输**：
+    将虚拟机中转换好的文件夹重命名为 `model_zoo`，传输至板端。
+    ```
+    scp -r ./deploy_output linaro@<板子IP>:~/trader_system/model_zoo
+    ```
+2.  **依赖安装**：
+    在板子上安装 `numpy` 和 `rknn_toolkit_lite2` (通常通过 wheel 包安装)。
+3.  **运行推理**：
+    运行 `deploy_inference.py`。
+    ```
+    python3 deploy_inference.py
+    ```
+
+### 2. 关键设计
+*   **动态加载**：实现了 `load_stock(sector, name)` 函数，根据股票名称自动定位路径加载对应的 `.rknn` 和 `.json`。
+*   **脱离 Sklearn**：板端推理代码手写了 `MinMaxScaling` 逻辑 (`data * scale + min`)，无需安装庞大的 `scikit-learn` 库。
+*   **NPU 加速**：初始化时指定 `core_mask=RKNNLite.NPU_CORE_0`，调用硬件算力。
+
+---
+
+## 常用命令速查
+
+**Windows:**
+```powershell
+# 导出所有模型
+python deploy_export.py
+(输入 all)
+```
+
+**Linux 虚拟机:**
+```
+# 激活环境
+conda activate rknn
+# 转换模型
+python deploy_convert_batch.py
+# 发送到板子
+scp -r ./deploy_output linaro@192.168.x.x:~/trader_system/model_zoo
+```
+
+**RK3568:**
+```
+# 运行预测
+python3 deploy_inference.py
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pycharm运行遇到的numpy，toolkit2和npu2的环境问题：
+好的，这是一份针对你刚刚经历的 **RK3568 模型部署环境配置与故障排查** 的完整技术文档。
+
+这份文档总结了从 PC 端环境依赖冲突到开发板端驱动版本不匹配的完整解决流程。你可以将其保存为 `RKNN_Env_Troubleshooting.md` 以备后续参考。
+
+---
+
+# RKNN-Toolkit2 (RK3568) 环境配置与版本兼容性问题修复文档
+
+**日期**: 2025-12-06
+**硬件平台**: RK3568 开发板
+**开发环境**: Ubuntu (PC) + Python 3.11
+
+## 1. PC 端开发环境问题 (Python 依赖)
+
+### 问题描述
+在运行 RKNN 模型转换脚本时，出现以下报错：
+*   **报错 1**: `RuntimeError: Numpy is not available` 或 `Segmentation fault (SIGSEGV)`。
+*   **报错 2**: `ImportError: numpy.core.multiarray failed to import`。
+*   **报错 3**: `pip` 提示 `opencv-python` 依赖冲突。
+
+### 根本原因
+*   **NumPy 版本不兼容**: `rknn-toolkit2` (v1.6.0) 底层 C++ 库是基于 NumPy 1.x 编译的。而环境中安装了最新的 NumPy 2.x (如 2.2.6)，导致 ABI（二进制接口）不兼容，引发崩溃。
+*   **OpenCV 版本过高**: 最新版的 `opencv-python` (v4.12+) 强制依赖 NumPy 2.x，与 RKNN 的需求冲突。
+
+### 解决方案
+必须将 NumPy 降级到 2.0 以下，并同时降级 OpenCV 以适配低版本 NumPy。
+
+**执行命令**:
+```
+# 1. 卸载当前不兼容的包
+pip uninstall numpy opencv-python -y
+
+# 2. 安装兼容版本 (NumPy 1.x 和旧版 OpenCV)
+pip install "numpy<2.0" "opencv-python<4.11"
+
+# 推荐具体版本:
+# numpy == 1.26.4
+# opencv-python == 4.10.x 或 4.9.x
+```
+
+---
+
+## 2. 开发板端运行环境问题 (驱动版本不匹配)
+
+### 问题描述
+PC 端模型转换成功，但在使用 `init_runtime(target='rk3568')` 连接开发板进行推理时报错：
+*   **报错**: `RKNN init failed. error code: RKNN_ERR_MODEL_INVALID`
+*   **日志**:
+    ```text
+    D RKNNAPI: RKNN VERSION:
+    D RKNNAPI:   API: 1.6.0 ... (PC端)
+    D RKNNAPI:   DRV: rknn_server: 1.5.0 ... (板端)
+    ```
+
+### 根本原因
+**版本跨度不兼容**。
+*   PC 端使用的是 SDK **v1.6.0**，生成的模型格式较新。
+*   开发板上的驱动 (`rknn_server` 和 `librknnrt.so`) 版本为 **v1.5.0**。
+*   旧版驱动无法加载新版 SDK 生成的模型，因此报“模型无效”。
+
+### 解决方案
+利用 `rknpu2` 仓库中的文件，手动升级开发板上的 NPU 驱动。
+
+#### 所需文件 (来自 rknpu2 仓库)
+1.  **librknnrt.so**: 位于 `runtime/RK356X/Linux/librknn_api/aarch64/`
+2.  **rknn_server**: 位于 `runtime/RK356X/Linux/rknn_server/aarch64/usr/bin/`
+
+#### 升级步骤 (ADB 操作)
+
+由于开发板系统分区通常只读，且直接推送可能失败，建议采用 **“先推送到临时目录，再复制覆盖”** 的策略。
+
+**步骤 1: 将文件推送到开发板临时目录**
+```
+# 在 PC 终端执行
+adb push path/to/librknnrt.so /userdata/librknnrt.so
+adb push path/to/rknn_server /userdata/rknn_server
+```
+
+**步骤 2: 进入板端 Shell 进行覆盖**
+```
+adb shell
+
+# 以下命令在板子内部执行 (# 提示符下)
+su                       # 确保获取 root 权限
+mount -o remount,rw /    # 关键：挂载系统为可读写
+
+# 替换运行时库
+cp /userdata/librknnrt.so /usr/lib/librknnrt.so
+cp /userdata/librknnrt.so /usr/lib64/librknnrt.so  # 如果有 lib64 目录的话
+
+# 替换服务端程序
+cp /userdata/rknn_server /usr/bin/rknn_server
+chmod +x /usr/bin/rknn_server  # 赋予执行权限
+```
+
+**步骤 3: 重启服务**
+建议直接重启板子以清除旧进程残留：
+```
+reboot
+```
+或者手动重启服务：
+```
+killall -9 rknn_server
+rknn_server &
+```
+
+**步骤 4: 验证版本**
+```
+rknn_server -v
+# 预期输出: version: 1.5.2 或 1.6.0 (必须 > 1.5.0)
+```
+
+---
+
+## 3. 常见报错备忘录
+
+| 错误现象 | 原因 | 解决方法 |
+| :--- | :--- | :--- |
+| `ValueError: quantize_mode is not supported` | API 参数废弃。Toolkit2 v1.6+ 已移除该参数。 | 删除 `config` 中的 `quantize_mode` 参数。 |
+| `RuntimeError: Numpy is not available` | NumPy 版本为 2.x。 | 降级 NumPy (`pip install "numpy<2"`). |
+| `RKNN_ERR_MODEL_INVALID` (联机时) | 板端驱动版本低于 PC 端 SDK 版本。 | 参考本文第 2 节升级板端驱动。 |
+| `Address already in use` (启动 server 时) | 端口被占用，通常是因为旧的 server 没杀掉。 | 执行 `killall -9 rknn_server` 或重启板子。 |
+| `adb push ... remote Is a directory` | 推送时目标路径只写了目录，ADB 没识别出来。 | 推送时要在目标路径加上具体文件名。 |
+
+---
+
+## 4. 最终验证环境版本 (参考)
+
+要确保整个流程跑通，建议保持以下版本组合：
+
+*   **PC Python**: 3.8 ~ 3.11
+*   **PC NumPy**: 1.26.x (必须 < 2.0)
+*   **PC RKNN-Toolkit2**: v1.6.0
+*   **开发板 rknn_server**: v1.5.2 或 v1.6.0
+*   **开发板 librknnrt.so**: v1.5.2 或 v1.6.0
